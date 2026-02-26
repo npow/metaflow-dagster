@@ -93,6 +93,20 @@ result = ParametrizedFlow.execute_in_process(run_config={
 })
 ```
 
+### Step decorators (`--with`)
+
+Inject Metaflow step decorators at deploy time without modifying the flow source:
+
+```bash
+# Run every step in a sandbox (e.g. metaflow-sandbox extension)
+python my_flow.py dagster create my_flow_dagster.py --with=sandbox
+
+# Multiple decorators are supported
+python my_flow.py dagster create my_flow_dagster.py \
+  --with=sandbox \
+  --with='resources:cpu=4,memory=8000'
+```
+
 ### Attach tags
 
 Metaflow tags are forwarded to every `metaflow step` subprocess at compile time:

@@ -42,11 +42,6 @@ def _validate_workflow(flow, graph):
             raise DagsterException(
                 "Deploying flows with @parallel decorator to Dagster is not supported."
             )
-        if any(d.name == "batch" for d in node.decorators):
-            raise DagsterException(
-                "Step *%s* uses @batch which is not supported with Dagster. "
-                "Remove @batch or use local execution." % node.name
-            )
 
 
 @click.group()
@@ -77,6 +72,14 @@ def dagster(obj):
     "Can be specified multiple times.",
 )
 @click.option(
+    "--with",
+    "with_decorators",
+    multiple=True,
+    default=None,
+    help="Inject a Metaflow step decorator at deploy time (repeatable), "
+    "e.g. --with=sandbox or --with='resources:cpu=4'.",
+)
+@click.option(
     "--namespace",
     "user_namespace",
     default=None,
@@ -89,7 +92,7 @@ def dagster(obj):
     help="Maximum number of concurrent Dagster workers.",
 )
 @click.pass_obj
-def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16):
+def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16, with_decorators=None):
     if os.path.abspath(sys.argv[0]) == os.path.abspath(file):
         raise MetaflowException(
             "Dagster output file cannot be the same as the flow file."
@@ -134,6 +137,7 @@ def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16)
         event_logger=obj.event_logger,
         monitor=obj.monitor,
         tags=list(tags) if tags else [],
+        with_decorators=list(with_decorators) if with_decorators else [],
         namespace=user_namespace,
         username=get_username(),
         max_workers=max_workers,

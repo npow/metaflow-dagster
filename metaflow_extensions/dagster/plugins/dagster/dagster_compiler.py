@@ -262,6 +262,7 @@ class DagsterCompiler:
         event_logger,
         monitor,
         tags: List[str],
+        with_decorators: List[str],
         namespace: Optional[str],
         username: str,
         max_workers: int,
@@ -277,6 +278,7 @@ class DagsterCompiler:
         self.event_logger = event_logger
         self.monitor = monitor
         self.tags = tags
+        self.with_decorators = with_decorators
         self.namespace = namespace
         self.username = username
         self.max_workers = max_workers
@@ -767,9 +769,9 @@ class DagsterCompiler:
     # ── Utilities ──────────────────────────────────────────────────────────────
 
     def _tags_args_code(self) -> str:
-        if not self.tags:
-            return "[]"
         args = []
         for tag in self.tags:
             args += ["--tag", tag]
+        for deco in self.with_decorators:
+            args += [f"--with={deco}"]
         return repr(args)
