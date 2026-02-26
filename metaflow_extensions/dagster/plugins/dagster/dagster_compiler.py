@@ -59,6 +59,7 @@ from dagster import (
     OpExecutionContext,
     Out,
     Output,
+    RetryPolicy,
     ScheduleDefinition,
     job,
     op,
@@ -144,7 +145,9 @@ def _run_step(
     run_id: str,
     input_paths: str,
     task_id: str,
+    retry_count: int = 0,
     extra_args: Optional[List[str]] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> str:
     """Execute one Metaflow step. Returns its full task pathspec."""
     cmd = (
@@ -154,14 +157,14 @@ def _run_step(
             "step", step_name,
             "--run-id", run_id,
             "--task-id", task_id,
-            "--retry-count", "0",
+            "--retry-count", str(retry_count),
             "--max-user-code-retries", "0",
             "--input-paths", input_paths,
         ]
     )
     if extra_args:
         cmd.extend(extra_args)
-    _run_cmd(context, cmd)
+    _run_cmd(context, cmd, extra_env)
     return f"{{run_id}}/{{step_name}}/{{task_id}}"
 
 
@@ -266,6 +269,7 @@ class DagsterCompiler:
         namespace: Optional[str],
         username: str,
         max_workers: int,
+        workflow_timeout: Optional[int],
         step_env: Dict[str, str],
     ):
         self.job_name = job_name
@@ -282,6 +286,7 @@ class DagsterCompiler:
         self.namespace = namespace
         self.username = username
         self.max_workers = max_workers
+        self.workflow_timeout = workflow_timeout
         self.step_env = step_env
 
         self.flow_name = flow.name
@@ -406,6 +411,69 @@ class DagsterCompiler:
         else:
             raise NotImplementedError(f"Unsupported node type: {ntype!r} for step {node.name!r}")
 
+    # ── Per-step decorator helpers ─────────────────────────────────────────────
+
+    def _get_retry_info(self, node):
+        """Returns (max_retries, delay_seconds_or_None) from @retry decorator."""
+        max_retries = 0
+        for deco in node.decorators:
+            try:
+                user_retries, _ = deco.step_task_retry_count()
+                max_retries = max(max_retries, user_retries)
+            except Exception:
+                pass
+        delay_seconds = None
+        for deco in node.decorators:
+            if deco.name == "retry":
+                mins = deco.attributes.get("minutes_between_retries", 0)
+                if mins:
+                    delay_seconds = int(mins) * 60
+                break
+        return max_retries, delay_seconds
+
+    def _get_timeout_seconds(self, node) -> Optional[int]:
+        """Returns timeout in seconds from @timeout decorator, or None."""
+        for deco in node.decorators:
+            if deco.name == "timeout":
+                secs = int(deco.attributes.get("seconds") or 0)
+                mins = int(deco.attributes.get("minutes") or 0)
+                hours = int(deco.attributes.get("hours") or 0)
+                total = secs + mins * 60 + hours * 3600
+                if total > 0:
+                    return total
+        return None
+
+    def _get_env_vars(self, node) -> Dict[str, str]:
+        """Returns env vars dict from @environment decorator."""
+        for deco in node.decorators:
+            if deco.name == "environment":
+                return deco.attributes.get("vars") or {}
+        return {}
+
+    def _op_decorator_str(self, node, ins_spec: str = "", out_spec: str = "") -> str:
+        """Build '@op(...)' string, including retry_policy and tags if applicable."""
+        max_retries, delay_seconds = self._get_retry_info(node)
+        timeout_seconds = self._get_timeout_seconds(node)
+
+        parts = []
+        if ins_spec:
+            parts.append(f"ins={ins_spec}")
+        if out_spec:
+            parts.append(f"out={out_spec}")
+        if max_retries > 0:
+            if delay_seconds:
+                parts.append(f"retry_policy=RetryPolicy(max_retries={max_retries}, delay={delay_seconds})")
+            else:
+                parts.append(f"retry_policy=RetryPolicy(max_retries={max_retries})")
+        if timeout_seconds:
+            parts.append(f'tags={{"dagster/op_execution_timeout": "{timeout_seconds}"}}')
+        return f"@op({', '.join(parts)})"
+
+    def _extra_env_code(self, node) -> str:
+        """Returns a Python dict literal for @environment vars, or 'None'."""
+        env_vars = self._get_env_vars(node)
+        return repr(env_vars) if env_vars else "None"
+
     # start op (handles any start type) ───────────────────────────────────────
 
     def _render_start_op(self, node) -> str:
@@ -417,6 +485,7 @@ class DagsterCompiler:
             if self.parameters else "{}"
         )
         tags_code = self._tags_args_code()
+        env_code = self._extra_env_code(node)
 
         # The common body: init then step
         common = (
@@ -425,13 +494,16 @@ class DagsterCompiler:
             f'    params_path = _run_init(context, run_id, "params", parameters)\n'
             f'    task_path = _run_step(\n'
             f'        context, "start", run_id, params_path, "1",\n'
+            f'        retry_count=context.retry_number,\n'
             f'        extra_args={tags_code},\n'
+            f'        extra_env={env_code},\n'
             f'    )\n'
         )
 
         if ntype in ("start", "linear"):
+            deco = self._op_decorator_str(node, out_spec="Out(str)")
             return (
-                f'@op(out=Out(str))\n'
+                f'{deco}\n'
                 f'def {self._op_name("start")}(context: OpExecutionContext{config_ann}) -> str:\n'
                 + common
                 + f'    _add_step_metadata(context, task_path)\n'
@@ -441,19 +513,21 @@ class DagsterCompiler:
             branches = node.out_funcs
             first_branch = branches[0]
             out_spec = "{" + ", ".join(f'"{b}": Out(str)' for b in branches) + "}"
+            deco = self._op_decorator_str(node, out_spec=out_spec)
             yields = "".join(
                 f'    yield Output(task_path, output_name="{b}")\n' for b in branches
             )
             return (
-                f'@op(out={out_spec})\n'
+                f'{deco}\n'
                 f'def {self._op_name("start")}(context: OpExecutionContext{config_ann}):\n'
                 + common
                 + f'    _add_step_metadata(context, task_path, output_name="{first_branch}")\n'
                 + yields
             )
         elif ntype == "foreach":
+            deco = self._op_decorator_str(node, out_spec="DynamicOut(str)")
             return (
-                f'@op(out=DynamicOut(str))\n'
+                f'{deco}\n'
                 f'def {self._op_name("start")}(context: OpExecutionContext{config_ann}):\n'
                 + common
                 + f'    _add_step_metadata(context, task_path)\n'
@@ -469,11 +543,15 @@ class DagsterCompiler:
     def _render_end_op(self, node) -> str:
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
         extra = self._tags_args_code()
+        env_code = self._extra_env_code(node)
+        ins_spec = '{"' + in_name + '": In(str)}'
+        deco = self._op_decorator_str(node, ins_spec=ins_spec)
         return dedent(f"""\
-            @op(ins={{"{in_name}": In(str)}})
+            {deco}
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str) -> None:
                 run_id = {in_name}.split("/")[0]
-                _run_step(context, "end", run_id, {in_name}, "1", extra_args={extra})
+                _run_step(context, "end", run_id, {in_name}, "1",
+                    retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
         """)
 
     # linear op ────────────────────────────────────────────────────────────────
@@ -485,11 +563,14 @@ class DagsterCompiler:
         )
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
         extra = self._tags_args_code()
+        env_code = self._extra_env_code(node)
+        ins_spec = '{"' + in_name + '": In(str)}'
+        deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="Out(str)")
 
         if parent_is_foreach:
             # Body step of a foreach: receives encoded task_path + split index
             return dedent(f"""\
-                @op(ins={{"{in_name}": In(str)}}, out=Out(str))
+                {deco}
                 def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str) -> str:
                     # {in_name} = "run_id/step/task_id//_i=N"
                     parts = {in_name}.split("//_i=")
@@ -498,17 +579,20 @@ class DagsterCompiler:
                     task_id = f"1-{{split_index}}"
                     task_path = _run_step(
                         context, "{node.name}", run_id, base_path, task_id,
+                        retry_count=context.retry_number,
                         extra_args=["--split-index", str(split_index)] + {extra},
+                        extra_env={env_code},
                     )
                     _add_step_metadata(context, task_path)
                     return task_path
             """)
         else:
             return dedent(f"""\
-                @op(ins={{"{in_name}": In(str)}}, out=Out(str))
+                {deco}
                 def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str) -> str:
                     run_id = {in_name}.split("/")[0]
-                    task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1", extra_args={extra})
+                    task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1",
+                        retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
                     _add_step_metadata(context, task_path)
                     return task_path
             """)
@@ -520,15 +604,19 @@ class DagsterCompiler:
         branches = node.out_funcs
         first_branch = branches[0]
         out_spec = "{" + ", ".join(f'"{b}": Out(str)' for b in branches) + "}"
+        ins_spec = '{"' + in_name + '": In(str)}'
         extra = self._tags_args_code()
+        env_code = self._extra_env_code(node)
+        deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec=out_spec)
         yields = "\n    ".join(
             f'yield Output(task_path, output_name="{b}")' for b in branches
         )
         return dedent(f"""\
-            @op(ins={{"{in_name}": In(str)}}, out={out_spec})
+            {deco}
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str):
                 run_id = {in_name}.split("/")[0]
-                task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1", extra_args={extra})
+                task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1",
+                    retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
                 _add_step_metadata(context, task_path, output_name="{first_branch}")
                 {yields}
         """)
@@ -544,18 +632,21 @@ class DagsterCompiler:
             )
         )
         extra = self._tags_args_code()
+        env_code = self._extra_env_code(node)
 
         if is_foreach_join:
-            # Receives collected DynamicOutputs as List[str]
             in_name = "foreach_results"
+            ins_spec = '{"foreach_results": In(list)}'
+            deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="Out(str)")
             return dedent(f"""\
-                @op(ins={{"{in_name}": In(list)}}, out=Out(str))
+                {deco}
                 def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: list) -> str:
                     run_id = {in_name}[0].split("/")[0]
                     from metaflow.util import compress_list
                     clean = [{in_name}[i].split("//_i=")[0] for i in range(len({in_name}))]
                     input_paths = compress_list(clean)
-                    task_path = _run_step(context, "{node.name}", run_id, input_paths, "1", extra_args={extra})
+                    task_path = _run_step(context, "{node.name}", run_id, input_paths, "1",
+                        retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
                     _add_step_metadata(context, task_path)
                     return task_path
             """)
@@ -565,13 +656,15 @@ class DagsterCompiler:
             ins_spec = "{" + ", ".join(ins_parts) + "}"
             args = ", ".join(node.in_funcs)
             paths_list = "[" + ", ".join(node.in_funcs) + "]"
+            deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="Out(str)")
             return dedent(f"""\
-                @op(ins={ins_spec}, out=Out(str))
+                {deco}
                 def {self._op_name(node.name)}(context: OpExecutionContext, {args}) -> str:
                     run_id = {node.in_funcs[0]}.split("/")[0]
                     from metaflow.util import compress_list
                     input_paths = compress_list({paths_list})
-                    task_path = _run_step(context, "{node.name}", run_id, input_paths, "1", extra_args={extra})
+                    task_path = _run_step(context, "{node.name}", run_id, input_paths, "1",
+                        retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
                     _add_step_metadata(context, task_path)
                     return task_path
             """)
@@ -581,14 +674,18 @@ class DagsterCompiler:
     def _render_foreach_op(self, node) -> str:
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
         extra = self._tags_args_code()
+        env_code = self._extra_env_code(node)
+        ins_spec = '{"' + in_name + '": In(str)}'
+        deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="DynamicOut(str)")
         # Note: we use _i to avoid clashing with any user variable names
         # The f-string in generated code: we must use non-f-string concat to avoid
         # the compiler's own f-string from interpolating {_i} prematurely.
         return dedent(f"""\
-            @op(ins={{"{in_name}": In(str)}}, out=DynamicOut(str))
+            {deco}
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str):
                 run_id = {in_name}.split("/")[0]
-                task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1", extra_args={extra})
+                task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1",
+                    retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
                 _add_step_metadata(context, task_path)
                 num_splits = _get_foreach_splits(run_id, "{node.name}", "1")
                 for _i in range(num_splits):
@@ -601,6 +698,9 @@ class DagsterCompiler:
         body = self._generate_job_body()
         # Build manually — dedent(f"""...""") mishandles multi-line substitutions
         body_indented = "\n".join("    " + line for line in body.splitlines())
+        if self.workflow_timeout:
+            tags_arg = f'tags={{"dagster/max_runtime": "{self.workflow_timeout}"}}'
+            return f"@job({tags_arg})\ndef {self.job_name}():\n{body_indented}\n"
         return f"@job\ndef {self.job_name}():\n{body_indented}\n"
 
     def _generate_job_body(self) -> str:

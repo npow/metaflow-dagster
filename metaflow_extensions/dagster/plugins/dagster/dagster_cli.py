@@ -16,7 +16,7 @@ class DagsterException(MetaflowException):
 VALID_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
 
-def _resolve_job_name(name, flow_name):
+def _resolve_job_name(name, flow_name, flow=None):
     if name:
         if not all(c in VALID_NAME_CHARS for c in name):
             raise MetaflowException(
@@ -24,7 +24,16 @@ def _resolve_job_name(name, flow_name):
                 "Use only letters, digits and underscores." % name
             )
         return name
-    # Default: snake_case of flow name
+    # Detect @project(name=...) and prefix: project_FlowName
+    if flow is not None:
+        try:
+            project_decos = flow._flow_decorators.get("project")
+        except Exception:
+            project_decos = None
+        if project_decos:
+            project_name = project_decos[0].attributes.get("name")
+            if project_name:
+                return "%s_%s" % (project_name, flow_name)
     return flow_name
 
 
@@ -36,11 +45,26 @@ def _validate_workflow(flow, graph):
                 "Parameter *%s* does not have a default value. "
                 "A default value is required when deploying to Dagster." % param.name
             )
-    # Validate no parallel decorators
+    # Validate no parallel decorators or unsupported step decorators
     for node in graph:
         if node.parallel_foreach:
             raise DagsterException(
                 "Deploying flows with @parallel decorator to Dagster is not supported."
+            )
+        for deco in node.decorators:
+            if deco.name == "slurm":
+                raise DagsterException(
+                    "Step *%s* uses @slurm which is not supported with Dagster." % node.name
+                )
+    # Validate no unsupported flow-level decorators
+    for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):
+        try:
+            decos = flow._flow_decorators.get(bad_deco)
+        except Exception:
+            decos = None
+        if decos:
+            raise DagsterException(
+                "@%s is not supported with Dagster deployments." % bad_deco
             )
 
 
@@ -91,14 +115,21 @@ def dagster(obj):
     show_default=True,
     help="Maximum number of concurrent Dagster workers.",
 )
+@click.option(
+    "--workflow-timeout",
+    default=None,
+    type=int,
+    help="Maximum wall-clock seconds for the entire job run.",
+)
 @click.pass_obj
-def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16, with_decorators=None):
+def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
+           with_decorators=None, workflow_timeout=None):
     if os.path.abspath(sys.argv[0]) == os.path.abspath(file):
         raise MetaflowException(
             "Dagster output file cannot be the same as the flow file."
         )
 
-    job_name = _resolve_job_name(name, obj.flow.name)
+    job_name = _resolve_job_name(name, obj.flow.name, obj.flow)
 
     _validate_workflow(obj.flow, obj.graph)
 
@@ -141,6 +172,7 @@ def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
         namespace=user_namespace,
         username=get_username(),
         max_workers=max_workers,
+        workflow_timeout=workflow_timeout,
         step_env=step_env,
     )
 

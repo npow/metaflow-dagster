@@ -403,3 +403,101 @@ class TestParametrizedFlow:
         fields = config_cls.__fields__ if hasattr(config_cls, "__fields__") else config_cls.model_fields
         assert "greeting" in fields
         assert "count" in fields
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Decorator feature tests (@retry, @timeout, @environment, @project, --workflow-timeout)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestDecoratorFeatures:
+
+    def test_retry_generates_retry_policy(self, tmp_path):
+        """@retry(times=3) produces RetryPolicy(max_retries=3) on the op."""
+        out = tmp_path / "retry_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "retry_flow.py", out, ds)
+        code = out.read_text()
+
+        assert "RetryPolicy" in code
+        assert "max_retries=3" in code
+
+    def test_retry_delay_generates_delay(self, tmp_path):
+        """@retry(minutes_between_retries=2) produces delay=120 in RetryPolicy."""
+        out = tmp_path / "retry_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "retry_flow.py", out, ds)
+        code = out.read_text()
+
+        assert "delay=120" in code
+
+    def test_timeout_generates_op_tag(self, tmp_path):
+        """@timeout(seconds=120) produces dagster/op_execution_timeout tag."""
+        out = tmp_path / "retry_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "retry_flow.py", out, ds)
+        code = out.read_text()
+
+        assert "dagster/op_execution_timeout" in code
+        assert '"120"' in code
+
+    def test_environment_vars_in_extra_env(self, tmp_path):
+        """@environment(vars={...}) embeds vars as extra_env in the op."""
+        out = tmp_path / "retry_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "retry_flow.py", out, ds)
+        code = out.read_text()
+
+        assert "MY_VAR" in code
+        assert "hello" in code
+        assert "OTHER" in code
+
+    def test_retry_count_uses_context_retry_number(self, tmp_path):
+        """retry_count=context.retry_number is passed to every _run_step call."""
+        out = tmp_path / "retry_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "retry_flow.py", out, ds)
+        code = out.read_text()
+
+        assert "retry_count=context.retry_number" in code
+
+    def test_workflow_timeout_sets_job_tag(self, tmp_path):
+        """--workflow-timeout adds dagster/max_runtime tag to the @job."""
+        out = tmp_path / "timeout_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "linear_flow.py", out, ds, extra_args=["--workflow-timeout", "3600"])
+        code = out.read_text()
+
+        assert "dagster/max_runtime" in code
+        assert "3600" in code
+
+    def test_no_retry_no_retry_policy_on_ops(self, tmp_path):
+        """Steps without @retry do not emit retry_policy= on their ops."""
+        out = tmp_path / "linear_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "linear_flow.py", out, ds)
+        code = out.read_text()
+
+        assert "retry_policy=" not in code
+
+    def test_retry_flow_executes(self, tmp_path):
+        """A flow with @retry/@timeout/@environment decorators compiles and runs."""
+        out = tmp_path / "retry_dagster.py"
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _compile(FLOWS_DIR / "retry_flow.py", out, ds)
+        mod = _load_module(out)
+
+        result = _run_job(mod.RetryFlow)
+        assert result.success
+
+        start_output = result.output_for_node("op_start")
+        run_id = start_output.split("/")[0]
+        result_val = _read_artifact(ds, "RetryFlow", run_id, "process", "result")
+        assert result_val == 2
