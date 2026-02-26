@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metaflow-dagster"
+version = "0.1.0"
+description = "Metaflow extension to compile and deploy flows as Dagster jobs"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "metaflow>=2.10",
+]
+
+[project.optional-dependencies]
+test = [
+    "dagster>=1.7",
+    "dagster-webserver",
+    "pytest>=7",
+    "pytest-timeout",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["metaflow_extensions*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+log_cli = true
+log_cli_level = "INFO"
