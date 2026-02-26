@@ -107,6 +107,61 @@ python my_flow.py dagster create my_flow_dagster.py \
   --with='resources:cpu=4,memory=8000'
 ```
 
+### Retries and timeouts
+
+`@retry` and `@timeout` on any step are picked up automatically. The generated op gets a Dagster
+`RetryPolicy` and an `op_execution_timeout` tag — no extra configuration needed:
+
+```python
+class MyFlow(FlowSpec):
+    @retry(times=3, minutes_between_retries=2)
+    @timeout(seconds=300)
+    @step
+    def train(self):
+        ...
+```
+
+Generates:
+```python
+@op(retry_policy=RetryPolicy(max_retries=3, delay=120),
+    tags={"dagster/op_execution_timeout": "300"})
+def op_train(context): ...
+```
+
+Each Dagster retry passes the correct `--retry-count` to Metaflow so attempt numbering is consistent.
+
+### Environment variables
+
+`@environment(vars={...})` on a step passes those variables to the `metaflow step` subprocess:
+
+```python
+@environment(vars={"TOKENIZERS_PARALLELISM": "false"})
+@step
+def embed(self): ...
+```
+
+### Project namespace
+
+If the flow uses `@project(name=...)`, the Dagster job name is automatically prefixed:
+
+```python
+@project(name="recommendations")
+class TrainFlow(FlowSpec): ...
+```
+
+```bash
+python train_flow.py dagster create out.py
+# job name: recommendations_TrainFlow
+```
+
+### Workflow timeout
+
+Cap the total wall-clock time for the entire job run:
+
+```bash
+python my_flow.py dagster create my_flow_dagster.py --workflow-timeout 3600
+```
+
 ### Attach tags
 
 Metaflow tags are forwarded to every `metaflow step` subprocess at compile time:
