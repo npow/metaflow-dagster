@@ -76,6 +76,11 @@ METAFLOW_TOP_ARGS: List[str] = {top_args!r}
 # Metaflow env-vars forwarded to every subprocess
 METAFLOW_STEP_ENV: Dict[str, str] = {step_env!r}
 
+# Per-step runtime decorator specs and retry limits used to honor runtime_step_cli hooks.
+STEP_DECORATOR_SPECS: Dict[str, List[str]] = {step_decorator_specs!r}
+STEP_MAX_USER_CODE_RETRIES: Dict[str, int] = {step_max_user_code_retries!r}
+STEP_WITH_DECORATORS: Dict[str, List[str]] = {step_with_decorators!r}
+
 
 # ── Execution helpers ──────────────────────────────────────────────────────────
 
@@ -146,25 +151,180 @@ def _run_step(
     input_paths: str,
     task_id: str,
     retry_count: int = 0,
-    extra_args: Optional[List[str]] = None,
+    max_user_code_retries: int = 0,
+    tags: Optional[List[str]] = None,
+    split_index: Optional[int] = None,
     extra_env: Optional[Dict[str, str]] = None,
 ) -> str:
     """Execute one Metaflow step. Returns its full task pathspec."""
-    cmd = (
-        [sys.executable, FLOW_FILE]
-        + METAFLOW_TOP_ARGS
-        + [
-            "step", step_name,
-            "--run-id", run_id,
-            "--task-id", task_id,
-            "--retry-count", str(retry_count),
-            "--max-user-code-retries", "0",
-            "--input-paths", input_paths,
-        ]
+    code_package_cache = _run_step.__dict__.setdefault(
+        "_code_package_cache", {{"metadata": None, "sha": None, "url": None}}
     )
-    if extra_args:
-        cmd.extend(extra_args)
-    _run_cmd(context, cmd, extra_env)
+
+    def _ensure_code_package():
+        if (
+            code_package_cache["metadata"] is not None
+            and code_package_cache["sha"] is not None
+            and code_package_cache["url"] is not None
+        ):
+            return (
+                code_package_cache["metadata"],
+                code_package_cache["sha"],
+                code_package_cache["url"],
+            )
+
+        import re
+        import tempfile
+        from metaflow.datastore import FlowDataStore
+        from metaflow.plugins import DATASTORES
+
+        with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+            package_path = tmp.name
+        try:
+            package_cmd = (
+                [sys.executable, FLOW_FILE]
+                + [a for a in METAFLOW_TOP_ARGS if a != "--quiet"]
+                + ["package", "save", package_path]
+            )
+            result = subprocess.run(
+                package_cmd,
+                env=_build_env(),
+                capture_output=True,
+                text=True,
+                cwd=os.path.dirname(FLOW_FILE) or ".",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "Failed to build Metaflow code package:\\n"
+                    + (result.stderr or result.stdout)[-2000:]
+                )
+            meta_src = (result.stdout or "") + "\\n" + (result.stderr or "")
+            m = re.search(r"metadata:\\s*(\\{{.*\\}})", meta_src)
+            package_metadata = (
+                m.group(1).strip()
+                if m
+                else '{{"version": 0, "archive_format": "tgz", "mfcontent_version": 1}}'
+            )
+
+            with open(package_path, "rb") as f:
+                blob = f.read()
+
+            datastore_type = next(
+                (
+                    a.split("--datastore=", 1)[1]
+                    for a in METAFLOW_TOP_ARGS
+                    if a.startswith("--datastore=")
+                ),
+                None,
+            )
+            datastore_root = next(
+                (
+                    a.split("--datastore-root=", 1)[1]
+                    for a in METAFLOW_TOP_ARGS
+                    if a.startswith("--datastore-root=")
+                ),
+                None,
+            )
+            storage_impl = next(ds for ds in DATASTORES if ds.TYPE == datastore_type)
+            flow_datastore = FlowDataStore(
+                FLOW_NAME,
+                storage_impl=storage_impl,
+                ds_root=datastore_root,
+            )
+            package_url, package_sha = flow_datastore.save_data([blob], len_hint=1)[0]
+            code_package_cache["metadata"] = package_metadata
+            code_package_cache["sha"] = package_sha
+            code_package_cache["url"] = package_url
+        finally:
+            try:
+                os.unlink(package_path)
+            except Exception:
+                pass
+
+        return (
+            code_package_cache["metadata"],
+            code_package_cache["sha"],
+            code_package_cache["url"],
+        )
+
+    class _CLIArgs:
+        def __init__(self):
+            self.entrypoint = [sys.executable, FLOW_FILE]
+            self.top_level_args = list(METAFLOW_TOP_ARGS) + [
+                f"--with={{d}}" for d in STEP_WITH_DECORATORS.get(step_name, [])
+            ]
+            self.commands = ["step"]
+            self.command_args = [step_name]
+            self.command_options = {{
+                "run-id": run_id,
+                "task-id": task_id,
+                "input-paths": input_paths,
+                "retry-count": retry_count,
+                "max-user-code-retries": max_user_code_retries,
+                "tag": tags or [],
+                "namespace": next(
+                    (
+                        a.split("--namespace=", 1)[1]
+                        for a in METAFLOW_TOP_ARGS
+                        if a.startswith("--namespace=")
+                    ),
+                    "",
+                ),
+            }}
+            if split_index is not None:
+                self.command_options["split-index"] = split_index
+            self.env: Dict[str, str] = {{}}
+
+        def _options(self, mapping):
+            for k, v in mapping.items():
+                if v is None or v is False:
+                    continue
+                if k == "decospecs":
+                    k = "with"
+                k = k.replace("_", "-")
+                vals = v if isinstance(v, (list, tuple, set)) else [v]
+                for value in vals:
+                    yield f"--{{k}}"
+                    if not isinstance(value, bool):
+                        if isinstance(value, tuple):
+                            for vv in value:
+                                yield str(vv)
+                        else:
+                            yield str(value)
+
+        def get_args(self):
+            args = list(self.entrypoint)
+            args.extend(self.top_level_args)
+            args.extend(self.commands)
+            args.extend(
+                str(arg) if arg is not None else "" for arg in self.command_args
+            )
+            args.extend(self._options(self.command_options))
+            return args
+
+    cli_args = _CLIArgs()
+
+    from metaflow.decorators import extract_step_decorator_from_decospec
+
+    for spec in STEP_DECORATOR_SPECS.get(step_name, []):
+        deco, _ = extract_step_decorator_from_decospec(spec)
+        if (
+            hasattr(deco, "package_metadata")
+            and hasattr(deco, "package_sha")
+            and hasattr(deco, "package_url")
+            and getattr(deco, "package_metadata", None) is None
+        ):
+            package_metadata, package_sha, package_url = _ensure_code_package()
+            deco.package_metadata = package_metadata
+            deco.package_sha = package_sha
+            deco.package_url = package_url
+        deco.runtime_step_cli(cli_args, retry_count, max_user_code_retries, None)
+
+    cmd = cli_args.get_args()
+    merged_env = dict(cli_args.env)
+    if extra_env:
+        merged_env.update(extra_env)
+    _run_cmd(context, cmd, merged_env or None)
     return f"{{run_id}}/{{step_name}}/{{task_id}}"
 
 
@@ -319,6 +479,9 @@ class DagsterCompiler:
             output_file="<output.py>",
             top_args=self._build_top_args(),
             step_env=self.step_env,
+            step_decorator_specs=self._build_step_decorator_specs(),
+            step_max_user_code_retries=self._build_step_max_user_code_retries(),
+            step_with_decorators=self._build_step_with_decorators(),
         )
 
     def _build_top_args(self) -> List[str]:
@@ -339,6 +502,24 @@ class DagsterCompiler:
         if self.namespace:
             args.append("--namespace=%s" % self.namespace)
         return args
+
+    def _build_step_decorator_specs(self) -> Dict[str, List[str]]:
+        specs = {}
+        for node in self._topological_order():
+            step_specs = [d.make_decorator_spec() for d in node.decorators]
+            step_specs.extend(self.with_decorators)
+            specs[node.name] = step_specs
+        return specs
+
+    def _build_step_max_user_code_retries(self) -> Dict[str, int]:
+        retries = {}
+        for node in self._topological_order():
+            max_retries, _ = self._get_retry_info(node)
+            retries[node.name] = max_retries
+        return retries
+
+    def _build_step_with_decorators(self) -> Dict[str, List[str]]:
+        return {node.name: list(self.with_decorators) for node in self._topological_order()}
 
     # ── Config class ───────────────────────────────────────────────────────────
 
@@ -484,7 +665,7 @@ class DagsterCompiler:
             "{" + ", ".join(f'"{p["name"]}": config.{p["name"]}' for p in self.parameters) + "}"
             if self.parameters else "{}"
         )
-        tags_code = self._tags_args_code()
+        tags_code = repr(self.tags)
         env_code = self._extra_env_code(node)
 
         # The common body: init then step
@@ -495,7 +676,8 @@ class DagsterCompiler:
             f'    task_path = _run_step(\n'
             f'        context, "start", run_id, params_path, "1",\n'
             f'        retry_count=context.retry_number,\n'
-            f'        extra_args={tags_code},\n'
+            f'        max_user_code_retries=STEP_MAX_USER_CODE_RETRIES["start"],\n'
+            f'        tags={tags_code},\n'
             f'        extra_env={env_code},\n'
             f'    )\n'
         )
@@ -542,8 +724,9 @@ class DagsterCompiler:
 
     def _render_end_op(self, node) -> str:
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
-        extra = self._tags_args_code()
+        tags = repr(self.tags)
         env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
         ins_spec = '{"' + in_name + '": In(str)}'
         deco = self._op_decorator_str(node, ins_spec=ins_spec)
         return dedent(f"""\
@@ -551,7 +734,8 @@ class DagsterCompiler:
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str) -> None:
                 run_id = {in_name}.split("/")[0]
                 _run_step(context, "end", run_id, {in_name}, "1",
-                    retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
+                    retry_count=context.retry_number, max_user_code_retries={max_retries},
+                    tags={tags}, extra_env={env_code})
         """)
 
     # linear op ────────────────────────────────────────────────────────────────
@@ -562,8 +746,9 @@ class DagsterCompiler:
             for p in node.in_funcs
         )
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
-        extra = self._tags_args_code()
+        tags = repr(self.tags)
         env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
         ins_spec = '{"' + in_name + '": In(str)}'
         deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="Out(str)")
 
@@ -580,7 +765,9 @@ class DagsterCompiler:
                     task_path = _run_step(
                         context, "{node.name}", run_id, base_path, task_id,
                         retry_count=context.retry_number,
-                        extra_args=["--split-index", str(split_index)] + {extra},
+                        max_user_code_retries={max_retries},
+                        tags={tags},
+                        split_index=split_index,
                         extra_env={env_code},
                     )
                     _add_step_metadata(context, task_path)
@@ -592,7 +779,8 @@ class DagsterCompiler:
                 def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str) -> str:
                     run_id = {in_name}.split("/")[0]
                     task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1",
-                        retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
+                        retry_count=context.retry_number, max_user_code_retries={max_retries},
+                        tags={tags}, extra_env={env_code})
                     _add_step_metadata(context, task_path)
                     return task_path
             """)
@@ -605,8 +793,9 @@ class DagsterCompiler:
         first_branch = branches[0]
         out_spec = "{" + ", ".join(f'"{b}": Out(str)' for b in branches) + "}"
         ins_spec = '{"' + in_name + '": In(str)}'
-        extra = self._tags_args_code()
+        tags = repr(self.tags)
         env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
         deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec=out_spec)
         yields = "\n    ".join(
             f'yield Output(task_path, output_name="{b}")' for b in branches
@@ -616,7 +805,8 @@ class DagsterCompiler:
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str):
                 run_id = {in_name}.split("/")[0]
                 task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1",
-                    retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
+                    retry_count=context.retry_number, max_user_code_retries={max_retries},
+                    tags={tags}, extra_env={env_code})
                 _add_step_metadata(context, task_path, output_name="{first_branch}")
                 {yields}
         """)
@@ -631,8 +821,9 @@ class DagsterCompiler:
                 or node.split_parents[-1] == "start" and self.graph["start"].type == "foreach"
             )
         )
-        extra = self._tags_args_code()
+        tags = repr(self.tags)
         env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
 
         if is_foreach_join:
             in_name = "foreach_results"
@@ -646,7 +837,8 @@ class DagsterCompiler:
                     clean = [{in_name}[i].split("//_i=")[0] for i in range(len({in_name}))]
                     input_paths = compress_list(clean)
                     task_path = _run_step(context, "{node.name}", run_id, input_paths, "1",
-                        retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
+                        retry_count=context.retry_number, max_user_code_retries={max_retries},
+                        tags={tags}, extra_env={env_code})
                     _add_step_metadata(context, task_path)
                     return task_path
             """)
@@ -664,7 +856,8 @@ class DagsterCompiler:
                     from metaflow.util import compress_list
                     input_paths = compress_list({paths_list})
                     task_path = _run_step(context, "{node.name}", run_id, input_paths, "1",
-                        retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
+                        retry_count=context.retry_number, max_user_code_retries={max_retries},
+                        tags={tags}, extra_env={env_code})
                     _add_step_metadata(context, task_path)
                     return task_path
             """)
@@ -673,8 +866,9 @@ class DagsterCompiler:
 
     def _render_foreach_op(self, node) -> str:
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
-        extra = self._tags_args_code()
+        tags = repr(self.tags)
         env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
         ins_spec = '{"' + in_name + '": In(str)}'
         deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="DynamicOut(str)")
         # Note: we use _i to avoid clashing with any user variable names
@@ -685,7 +879,8 @@ class DagsterCompiler:
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str):
                 run_id = {in_name}.split("/")[0]
                 task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1",
-                    retry_count=context.retry_number, extra_args={extra}, extra_env={env_code})
+                    retry_count=context.retry_number, max_user_code_retries={max_retries},
+                    tags={tags}, extra_env={env_code})
                 _add_step_metadata(context, task_path)
                 num_splits = _get_foreach_splits(run_id, "{node.name}", "1")
                 for _i in range(num_splits):
@@ -869,9 +1064,5 @@ class DagsterCompiler:
     # ── Utilities ──────────────────────────────────────────────────────────────
 
     def _tags_args_code(self) -> str:
-        args = []
-        for tag in self.tags:
-            args += ["--tag", tag]
-        for deco in self.with_decorators:
-            args += [f"--with={deco}"]
-        return repr(args)
+        # Kept for backward compatibility with tests/imports; callers use repr(self.tags).
+        return repr(self.tags)

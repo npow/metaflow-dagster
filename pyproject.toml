@@ -7,7 +7,7 @@ name = "metaflow-dagster"
 version = "0.1.0"
 description = "Metaflow extension to compile and deploy flows as Dagster jobs"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     "metaflow>=2.10",
