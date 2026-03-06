@@ -1014,7 +1014,7 @@ class DagsterCompiler:
           5. Run inner_join at task_id "1-N-join"
           6. return inner_join path
         """
-        extra = self._tags_args_code()
+        tags_code = repr(self.tags)
         _IDX = ["_i", "_j", "_k", "_l", "_m"]
 
         # Use a list to collect lines (allows nested function to append to it)
@@ -1028,30 +1028,6 @@ class DagsterCompiler:
         # Outer foreach task_id is the last path component
         result_lines.append("_outer_fe_tid = _base_path.rsplit('/', 1)[-1]")
 
-        # Work with chain[1:] since chain[0][0] (outer_foreach) was already run externally.
-        # Build the "inner chain" for emission: each element is (foreach, body, join).
-        # At depth 0 in the inner chain, the foreach step is chain[0][1] and its join
-        # is chain[1][2] (the innermost join at this depth).
-        #
-        # Re-build the compound chain as viewed from inside the compound op:
-        # For a 2-level chain [(A, B, Aj), (B, leaf, Bj)]:
-        #   inner chain = [(B, leaf, Bj)]
-        #   depth 0: foreach=B, body=leaf, join=Bj
-        #   task_id prefix: _outer_fe_tid + "-" + str(_outer_split)  <- B's task_id
-        #   input to B: _base_path  (A's task path)
-        #
-        # For a 3-level chain [(A, B, Aj), (B, C, Bj), (C, leaf, Cj)]:
-        #   inner chain = [(B, C, Bj), (C, leaf, Cj)]
-        #   depth 0: foreach=B, body=C, join=Bj
-        #     B task_id = _outer_fe_tid + "-" + str(_outer_split)
-        #     loop over B splits (_i):
-        #       depth 1: foreach=C, body=leaf, join=Cj
-        #         C task_id = B_task_id + "-" + str(_i)
-        #         ...
-        #       results_1.append(Cj_path)
-        #   Run Bj with results_1
-        #   return Bj_path
-
         inner_chain = chain[1:]  # chain starting from the inner_foreach level
 
         def _emit(depth: int, indent: str, parent_path_expr: str, parent_task_id_var: str, split_var: str) -> str:
@@ -1061,8 +1037,10 @@ class DagsterCompiler:
 
             foreach_node = self.graph[foreach_name]
             foreach_env = self._extra_env_code(foreach_node)
+            foreach_max_retries, _ = self._get_retry_info(foreach_node)
             join_node = self.graph[join_name]
             join_env = self._extra_env_code(join_node)
+            join_max_retries, _ = self._get_retry_info(join_node)
 
             # Task IDs and variable names unique per depth
             fe_tid_var = "_fe_tid_%d" % depth
@@ -1082,9 +1060,9 @@ class DagsterCompiler:
             result_lines.append(indent + "    context, %r, run_id, %s," % (foreach_name, parent_path_expr))
             result_lines.append(indent + "    %s," % fe_tid_var)
             result_lines.append(indent + "    retry_count=context.retry_number,")
-            result_lines.append(
-                indent + '    extra_args=["--split-index", str(%s)] + %s,' % (split_var, extra)
-            )
+            result_lines.append(indent + "    max_user_code_retries=%d," % foreach_max_retries)
+            result_lines.append(indent + "    tags=%s," % tags_code)
+            result_lines.append(indent + "    split_index=%s," % split_var)
             result_lines.append(indent + "    extra_env=%s," % foreach_env)
             result_lines.append(indent + ")")
             result_lines.append(indent + "_add_step_metadata(context, %s)" % fe_path_var)
@@ -1103,6 +1081,7 @@ class DagsterCompiler:
                 # Innermost: body_name is a regular (non-foreach) step
                 body_node = self.graph[body_name]
                 body_env = self._extra_env_code(body_node)
+                body_max_retries, _ = self._get_retry_info(body_node)
                 body_tid_var = "_body_tid_%d" % depth
                 body_path_var = "_body_path_%d" % depth
                 result_lines.append(indent + '    %s = %s + "-" + str(%s)' % (body_tid_var, fe_tid_var, idx))
@@ -1110,9 +1089,9 @@ class DagsterCompiler:
                 result_lines.append(indent + "        context, %r, run_id, %s," % (body_name, fe_path_var))
                 result_lines.append(indent + "        %s," % body_tid_var)
                 result_lines.append(indent + "        retry_count=context.retry_number,")
-                result_lines.append(
-                    indent + '        extra_args=["--split-index", str(%s)] + %s,' % (idx, extra)
-                )
+                result_lines.append(indent + "        max_user_code_retries=%d," % body_max_retries)
+                result_lines.append(indent + "        tags=%s," % tags_code)
+                result_lines.append(indent + "        split_index=%s," % idx)
                 result_lines.append(indent + "        extra_env=%s," % body_env)
                 result_lines.append(indent + "    )")
                 result_lines.append(indent + "    _add_step_metadata(context, %s)" % body_path_var)
@@ -1130,7 +1109,8 @@ class DagsterCompiler:
             result_lines.append(indent + "    context, %r, run_id, _ji_%d," % (join_name, depth))
             result_lines.append(indent + "    %s," % join_tid_var)
             result_lines.append(indent + "    retry_count=context.retry_number,")
-            result_lines.append(indent + "    extra_args=%s," % extra)
+            result_lines.append(indent + "    max_user_code_retries=%d," % join_max_retries)
+            result_lines.append(indent + "    tags=%s," % tags_code)
             result_lines.append(indent + "    extra_env=%s," % join_env)
             result_lines.append(indent + ")")
             result_lines.append(indent + "_add_step_metadata(context, %s)" % join_path_var)
