@@ -5,4 +5,7 @@
 scheduler:
   scheduler_type: dagster
 
-compute_env: {}
+compute_env:
+  METAFLOW_DEFAULT_METADATA: local
+  METAFLOW_DEFAULT_DATASTORE: local
+  METAFLOW_DEFAULT_ENVIRONMENT: local

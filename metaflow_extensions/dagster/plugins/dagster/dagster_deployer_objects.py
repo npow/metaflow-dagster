@@ -36,6 +36,42 @@ class DagsterTriggeredRun(TriggeredRun):
         return None
 
     @property
+    def run(self):
+        """Retrieve the Run object, applying deployer env vars so local metadata works."""
+        import os
+        import metaflow
+        from metaflow.exception import MetaflowNotFound
+
+        env_vars = getattr(self.deployer, "env_vars", {}) or {}
+        meta_type = env_vars.get("METAFLOW_DEFAULT_METADATA")
+        sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+
+        old_meta = os.environ.get("METAFLOW_DEFAULT_METADATA")
+        old_sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+        try:
+            if meta_type:
+                os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
+                metaflow.metadata(meta_type)
+            if meta_type == "local" and sysroot is None:
+                sysroot = os.path.expanduser("~")
+            if sysroot:
+                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
+            return metaflow.Run(self.pathspec, _namespace_check=False)
+        except MetaflowNotFound:
+            return None
+        except Exception:
+            return None
+        finally:
+            if old_meta is None:
+                os.environ.pop("METAFLOW_DEFAULT_METADATA", None)
+            else:
+                os.environ["METAFLOW_DEFAULT_METADATA"] = old_meta
+            if old_sysroot is None:
+                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
+            else:
+                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
+
+    @property
     def status(self) -> Optional[str]:
         """Return a simple status string based on the underlying Metaflow run."""
         run = self.run
@@ -52,6 +88,38 @@ class DagsterDeployedFlow(DeployedFlow):
     """A Metaflow flow compiled as a Dagster definitions file."""
 
     TYPE: ClassVar[Optional[str]] = "dagster"
+
+    @property
+    def id(self) -> str:
+        """Deployment identifier encoding all info needed for ``from_deployment``."""
+        import json
+        additional_info = getattr(self.deployer, "additional_info", {}) or {}
+        return json.dumps({
+            "name": self.name,
+            "flow_name": self.flow_name,
+            "flow_file": getattr(self.deployer, "flow_file", None),
+            "definitions_file": additional_info.get("definitions_file"),
+        })
+
+    @classmethod
+    def from_deployment(cls, identifier: str, metadata: Optional[str] = None) -> "DagsterDeployedFlow":
+        """Recover a DagsterDeployedFlow from a deployment identifier.
+
+        The identifier is the JSON string returned by ``deployed_flow.id``.
+        """
+        import json
+        from .dagster_deployer import DagsterDeployer
+
+        info = json.loads(identifier)
+        flow_file = info["flow_file"]
+        deployer = DagsterDeployer(flow_file=flow_file, deployer_kwargs={})
+        deployer.name = info["name"]
+        deployer.flow_name = info["flow_name"]
+        deployer.metadata = metadata or "{}"
+        deployer.additional_info = {
+            "definitions_file": info.get("definitions_file"),
+        }
+        return cls(deployer=deployer)
 
     def run(self, **kwargs) -> DagsterTriggeredRun:
         """Trigger a new run of this deployed flow.

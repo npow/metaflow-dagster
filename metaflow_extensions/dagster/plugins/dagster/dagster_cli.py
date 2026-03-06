@@ -23,6 +23,61 @@ class DagsterException(MetaflowException):
 VALID_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
 
+def _fix_local_step_metadata(flow_name, run_id):
+    """Create missing step and task-level _self.json files for local metadata.
+
+    When Metaflow steps are run individually via CLI (as dagster does), the
+    step-level and task-level metadata registration may be skipped. This
+    function fills in the gaps so that the Metaflow client can enumerate
+    steps/tasks and determine run completion.
+    """
+    try:
+        from metaflow.metaflow_config import DATASTORE_LOCAL_DIR
+        home = os.path.expanduser("~")
+        local_dir = DATASTORE_LOCAL_DIR or ".metaflow"
+        run_dir = os.path.join(home, local_dir, flow_name, run_id)
+        if not os.path.isdir(run_dir):
+            return
+        import time as _time
+        import json as _json
+        ts = int(_time.time() * 1000)
+        for step_name in os.listdir(run_dir):
+            step_dir = os.path.join(run_dir, step_name)
+            if step_name.startswith("_meta") or not os.path.isdir(step_dir):
+                continue
+            # Fix step-level metadata
+            step_meta_dir = os.path.join(step_dir, "_meta")
+            step_self = os.path.join(step_meta_dir, "_self.json")
+            if not os.path.exists(step_self):
+                os.makedirs(step_meta_dir, exist_ok=True)
+                with open(step_self, "w") as f:
+                    _json.dump({
+                        "flow_id": flow_name,
+                        "run_number": run_id,
+                        "step_name": step_name,
+                        "ts_epoch": ts,
+                    }, f)
+            # Fix task-level metadata
+            for task_id in os.listdir(step_dir):
+                task_dir = os.path.join(step_dir, task_id)
+                if task_id.startswith("_meta") or not os.path.isdir(task_dir):
+                    continue
+                task_meta_dir = os.path.join(task_dir, "_meta")
+                task_self = os.path.join(task_meta_dir, "_self.json")
+                if not os.path.exists(task_self):
+                    os.makedirs(task_meta_dir, exist_ok=True)
+                    with open(task_self, "w") as f:
+                        _json.dump({
+                            "flow_id": flow_name,
+                            "run_number": run_id,
+                            "step_name": step_name,
+                            "task_id": task_id,
+                            "ts_epoch": ts,
+                        }, f)
+    except Exception:
+        pass  # Best-effort; don't fail if local metadata fixup fails
+
+
 def _resolve_job_name(name, flow_name, flow=None):
     if name:
         if not all(c in VALID_NAME_CHARS for c in name):
@@ -289,7 +344,12 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
                 config_file = tmp.name
             cmd += ["-c", config_file]
 
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        # Echo output so it's visible when show_output is on
+        if result.stdout:
+            sys.stderr.write(result.stdout)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
 
         if result.returncode != 0:
             raise DagsterException(
@@ -299,9 +359,27 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
         if config_file and os.path.exists(config_file):
             os.unlink(config_file)
 
+    import hashlib
+    import re
+    # Extract the Dagster run UUID from the job execute output so we can
+    # derive the same deterministic Metaflow run-id used inside the job.
+    dagster_run_uuid = None
+    combined_output = (result.stdout or "") + (result.stderr or "")
+    match = re.search(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", combined_output)
+    if match:
+        dagster_run_uuid = match.group(1)
+    if dagster_run_uuid:
+        run_id = "dagster-" + hashlib.sha1(dagster_run_uuid.encode()).hexdigest()[:12]
+    else:
+        import uuid as _uuid
+        run_id = "dagster-%s" % _uuid.uuid4()
+
+    # Fix local metadata: when steps are run individually via CLI, step-level
+    # _self.json files may not be created. Create them so Metaflow's client
+    # can enumerate steps and determine run completion.
+    _fix_local_step_metadata(obj.flow.name, run_id)
+
     if deployer_attribute_file:
-        import uuid
-        run_id = "dagster-%s" % uuid.uuid4()
         pathspec = "%s/%s" % (obj.flow.name, run_id)
         with open(deployer_attribute_file, "w") as f:
             json.dump(
