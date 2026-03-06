@@ -1,0 +1,8 @@
+######################################
+# UX Test Config for metaflow-dagster
+######################################
+
+scheduler:
+  scheduler_type: dagster
+
+compute_env: {}

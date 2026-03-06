@@ -101,7 +101,7 @@ def dagster(obj):
 
 
 @dagster.command(help="Compile this flow to a Dagster definitions file.")
-@click.argument("file", required=True)
+@click.argument("file", required=False, default=None)
 @click.option(
     "--name",
     default=None,
@@ -151,6 +151,8 @@ def dagster(obj):
 @click.pass_obj
 def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
            with_decorators=None, workflow_timeout=None, deployer_attribute_file=None):
+    if file is None:
+        file = "%s_dagster.py" % obj.flow.name.lower()
     if os.path.abspath(sys.argv[0]) == os.path.abspath(file):
         raise MetaflowException(
             "Dagster output file cannot be the same as the flow file."
@@ -221,9 +223,10 @@ def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
         with open(deployer_attribute_file, "w") as f:
             json.dump(
                 {
-                    "job_name": job_name,
-                    "definitions_file": os.path.abspath(file),
-                    "metadata": {"flow_name": obj.flow.name},
+                    "name": job_name,
+                    "flow_name": obj.flow.name,
+                    "metadata": "{}",
+                    "additional_info": {"definitions_file": os.path.abspath(file)},
                 },
                 f,
             )
@@ -232,8 +235,8 @@ def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
 @dagster.command(help="Trigger a Dagster job execution.")
 @click.option(
     "--definitions-file",
-    required=True,
-    help="Path to the generated Dagster definitions file.",
+    default=None,
+    help="Path to the generated Dagster definitions file. Defaults to <FlowName>_dagster.py.",
 )
 @click.option(
     "--job-name",
@@ -256,6 +259,8 @@ def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
 )
 @click.pass_obj
 def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attribute_file=None):
+    if definitions_file is None:
+        definitions_file = "%s_dagster.py" % obj.flow.name.lower()
     resolved_job_name = _resolve_job_name(job_name, obj.flow.name, obj.flow)
 
     cmd = [

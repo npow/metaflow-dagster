@@ -53,7 +53,7 @@ class DagsterDeployedFlow(DeployedFlow):
 
     TYPE: ClassVar[Optional[str]] = "dagster"
 
-    def trigger(self, **kwargs) -> DagsterTriggeredRun:
+    def run(self, **kwargs) -> DagsterTriggeredRun:
         """Trigger a new run of this deployed flow.
 
         Parameters
@@ -68,16 +68,22 @@ class DagsterDeployedFlow(DeployedFlow):
         # Convert kwargs to "key=value" strings for --run-param.
         run_params = tuple("%s=%s" % (k, v) for k, v in kwargs.items())
 
+        # Retrieve definitions_file from additional_info stored during create.
+        additional_info = getattr(self.deployer, "additional_info", {}) or {}
+        definitions_file = additional_info.get("definitions_file")
+
         with temporary_fifo() as (attribute_file_path, attribute_file_fd):
+            trigger_kwargs = dict(deployer_attribute_file=attribute_file_path)
+            if run_params:
+                trigger_kwargs["run_params"] = run_params
+            if definitions_file:
+                trigger_kwargs["definitions_file"] = definitions_file
             command = get_lower_level_group(
                 self.deployer.api,
                 self.deployer.top_level_kwargs,
                 self.deployer.TYPE,
                 self.deployer.deployer_kwargs,
-            ).trigger(
-                deployer_attribute_file=attribute_file_path,
-                run_params=run_params,
-            )
+            ).trigger(**trigger_kwargs)
 
             pid = self.deployer.spm.run_command(
                 [sys.executable, *command],
@@ -97,3 +103,6 @@ class DagsterDeployedFlow(DeployedFlow):
         raise RuntimeError(
             "Error triggering Dagster job for flow %r" % self.deployer.flow_file
         )
+
+    # Keep trigger() as an alias for backwards compatibility.
+    trigger = run
