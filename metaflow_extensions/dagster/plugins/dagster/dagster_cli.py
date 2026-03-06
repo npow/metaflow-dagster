@@ -1,5 +1,8 @@
+import json
 import os
+import subprocess
 import sys
+import warnings
 
 from metaflow._vendor import click
 from metaflow.exception import MetaflowException
@@ -7,6 +10,10 @@ from metaflow.metaflow_config_funcs import config_values
 from metaflow.util import get_username
 
 from .dagster_compiler import DagsterCompiler
+
+
+class NotSupportedException(MetaflowException):
+    headline = "Dagster not supported"
 
 
 class DagsterException(MetaflowException):
@@ -55,6 +62,20 @@ def _validate_workflow(flow, graph):
             if deco.name == "slurm":
                 raise DagsterException(
                     "Step *%s* uses @slurm which is not supported with Dagster." % node.name
+                )
+            if deco.name == "condition":
+                raise NotSupportedException(
+                    "Step *%s* uses @condition which is not supported with Dagster. "
+                    "Conditional branching via @condition produces incorrect generated "
+                    "code and must be removed." % node.name
+                )
+            if deco.name == "resources":
+                warnings.warn(
+                    "Step *%s* uses @resources. Resource requirements are not enforced "
+                    "by this integration — configure resources on your Dagster op/job "
+                    "resource definitions directly." % node.name,
+                    UserWarning,
+                    stacklevel=2,
                 )
     # Validate no unsupported flow-level decorators
     for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):
@@ -121,9 +142,15 @@ def dagster(obj):
     type=int,
     help="Maximum wall-clock seconds for the entire job run.",
 )
+@click.option(
+    "--deployer-attribute-file",
+    default=None,
+    hidden=True,
+    help="Write deployment info JSON here (used by Metaflow Deployer API).",
+)
 @click.pass_obj
 def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
-           with_decorators=None, workflow_timeout=None):
+           with_decorators=None, workflow_timeout=None, deployer_attribute_file=None):
     if os.path.abspath(sys.argv[0]) == os.path.abspath(file):
         raise MetaflowException(
             "Dagster output file cannot be the same as the flow file."
@@ -186,6 +213,105 @@ def create(obj, file, name=None, tags=None, user_namespace=None, max_workers=16,
             job_name=job_name,
             flow_name=obj.flow.name,
             file=file,
+        ),
+        bold=True,
+    )
+
+    if deployer_attribute_file:
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "job_name": job_name,
+                    "definitions_file": os.path.abspath(file),
+                    "metadata": {"flow_name": obj.flow.name},
+                },
+                f,
+            )
+
+
+@dagster.command(help="Trigger a Dagster job execution.")
+@click.option(
+    "--definitions-file",
+    required=True,
+    help="Path to the generated Dagster definitions file.",
+)
+@click.option(
+    "--job-name",
+    default=None,
+    type=str,
+    help="Dagster job name. Defaults to the flow name.",
+)
+@click.option(
+    "--run-param",
+    "run_params",
+    multiple=True,
+    default=None,
+    help="Flow parameter as key=value (repeatable).",
+)
+@click.option(
+    "--deployer-attribute-file",
+    default=None,
+    hidden=True,
+    help="Write triggered-run info JSON here (used by Metaflow Deployer API).",
+)
+@click.pass_obj
+def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attribute_file=None):
+    resolved_job_name = _resolve_job_name(job_name, obj.flow.name, obj.flow)
+
+    cmd = [
+        sys.executable, "-m", "dagster", "job", "execute",
+        "-f", definitions_file,
+        "-j", resolved_job_name,
+    ]
+
+    config_yaml_lines = []
+    for kv in (run_params or []):
+        k, _, v = kv.partition("=")
+        config_yaml_lines.append("%s: %s" % (k.strip(), v.strip()))
+
+    import tempfile
+    config_file = None
+    try:
+        if config_yaml_lines:
+            with tempfile.NamedTemporaryFile(
+                suffix=".yaml", delete=False, mode="w"
+            ) as tmp:
+                tmp.write("ops:\n")
+                tmp.write("  start:\n")
+                tmp.write("    config:\n")
+                for line in config_yaml_lines:
+                    tmp.write("      %s\n" % line)
+                config_file = tmp.name
+            cmd += ["-c", config_file]
+
+        result = subprocess.run(cmd, check=False)
+
+        if result.returncode != 0:
+            raise DagsterException(
+                "dagster job execute returned exit code %d." % result.returncode
+            )
+    finally:
+        if config_file and os.path.exists(config_file):
+            os.unlink(config_file)
+
+    if deployer_attribute_file:
+        import uuid
+        run_id = "dagster-%s" % uuid.uuid4()
+        pathspec = "%s/%s" % (obj.flow.name, run_id)
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "pathspec": pathspec,
+                    "job_name": resolved_job_name,
+                    "metadata": {"flow_name": obj.flow.name},
+                },
+                f,
+            )
+
+    obj.echo(
+        "Dagster job *{job_name}* executed from *{file}*.".format(
+            job_name=resolved_job_name,
+            file=definitions_file,
         ),
         bold=True,
     )

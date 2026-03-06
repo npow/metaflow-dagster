@@ -460,8 +460,26 @@ class DagsterCompiler:
         config = self._render_config_class()
         if config:
             parts.append(config)
+        # Determine which steps are handled inside compound ops and should not
+        # get their own top-level @op definition.
+        chains = self._foreach_chains()
+        steps_in_compound: set = set()
+        for outer_name, chain in chains.items():
+            if len(chain) > 1:
+                for d in range(1, len(chain)):
+                    _, body_n, join_n = chain[d]
+                    steps_in_compound.add(body_n)
+                    steps_in_compound.add(join_n)
+                # The outer body (chain[0][1]) is itself a foreach step; it is also
+                # handled inside the compound op body, NOT emitted as a standalone op.
+                steps_in_compound.add(chain[0][1])
         for node in self._topological_order():
-            parts.append(self._render_op(node))
+            if node.name not in steps_in_compound:
+                parts.append(self._render_op(node))
+        # Emit compound ops for any nested foreach chains
+        for outer_name, chain in chains.items():
+            if len(chain) > 1:
+                parts.append(self._render_nested_foreach_compound_op(chain))
         parts.append(self._render_job())
         if self.schedule:
             parts.append(self._render_schedule())
@@ -887,6 +905,244 @@ class DagsterCompiler:
                     yield DynamicOutput(task_path + "//_i=" + str(_i), mapping_key=str(_i))
         """)
 
+    # ── Foreach chain analysis ─────────────────────────────────────────────────
+
+    def _foreach_chains(self) -> Dict[str, List]:
+        """Return {outermost_foreach: chain} for every outermost foreach in the flow.
+
+        Each chain is a list of (foreach_name, body_name, join_name) tuples ordered
+        outermost-first.  The chain ends when body_name is NOT itself a foreach step,
+        so len(chain) == 1 for a simple (non-nested) foreach.
+        """
+        # foreach step name -> immediate body step name
+        foreach_body: Dict[str, str] = {}
+        for node in self._topological_order():
+            is_foreach = (
+                node.type == "foreach"
+                or (node.name == "start" and self.graph["start"].type == "foreach")
+            )
+            if is_foreach and node.out_funcs:
+                foreach_body[node.name] = node.out_funcs[0]
+
+        # foreach steps that are themselves the body of another foreach
+        nested_foreach = {body for body in foreach_body.values() if body in foreach_body}
+        # outermost = foreach steps not nested inside another foreach
+        outermost = [name for name in foreach_body if name not in nested_foreach]
+
+        chains: Dict[str, List] = {}
+        for outer in outermost:
+            chain: List = []
+            current = outer
+            while True:
+                body = foreach_body[current]
+                # Find the join step whose split_parents[-1] == current
+                join = None
+                for node in self._topological_order():
+                    if node.type == "join" and node.split_parents:
+                        if node.split_parents[-1] == current:
+                            join = node.name
+                            break
+                if join is None:
+                    break
+                chain.append((current, body, join))
+                if body in foreach_body:
+                    current = body
+                else:
+                    break
+            if chain:
+                chains[outer] = chain
+
+        return chains
+
+    # ── Compound op for nested foreach chains ─────────────────────────────────
+
+    def _compound_op_name(self, outer_foreach_name: str) -> str:
+        """Name for the compound op that handles the body of an outer foreach."""
+        return "op_%s__body" % outer_foreach_name
+
+    def _render_nested_foreach_compound_op(self, chain: List) -> str:
+        """Generate a compound op for the body of an outer foreach in a nested chain.
+
+        Dagster cannot have an op be downstream of more than one dynamic output
+        (nested .map() is not supported).  For any foreach chain of depth > 1 we
+        therefore generate a single @op that:
+
+          1.  Receives the outer foreach's DynamicOutput value (encoded path + //_i=N).
+          2.  Runs the outer body step (which is itself a foreach step).
+          3.  Loops over inner foreach splits.
+          4.  For each inner split runs the leaf body step(s).
+          5.  Runs the inner join step to collect inner results.
+          6.  Returns the inner join task path.
+
+        This op is then used with .map() on the outer foreach's DynamicOutput so
+        that the outer join can use .collect() on the results.
+        """
+        outer_foreach_name = chain[0][0]
+        compound_name = self._compound_op_name(outer_foreach_name)
+        in_name = outer_foreach_name
+        ins_spec = '{"' + in_name + '": In(str)}'
+
+        body_lines = self._compound_op_body_lines(chain, param_name=in_name)
+        body_text = "\n".join("    " + line for line in body_lines)
+        return (
+            "@op(ins=%s, out=Out(str))\n"
+            "def %s(context: OpExecutionContext, %s: str) -> str:\n"
+            "%s\n"
+        ) % (ins_spec, compound_name, in_name, body_text)
+
+    def _compound_op_body_lines(self, chain: List, param_name: str) -> List[str]:
+        """Generate body lines for a compound op that handles nested foreach.
+
+        The compound op is the BODY used with .map() on the outermost foreach's
+        DynamicOutput.  chain[0] = (outer_foreach, outer_body=inner_foreach, outer_join).
+        The compound op:
+          - Receives the outer_foreach's DynamicOutput value ("run_id/step/tid//_i=N")
+          - Does NOT re-run outer_foreach (already run by op_outer_foreach in the job)
+          - Runs outer_body (chain[0][1]) which is itself a foreach step
+          - Recursively handles deeper levels using chain[1:]
+          - Runs the innermost join (chain[-1][2])
+          - Returns the innermost join's task path
+          - outer_join (chain[0][2]) is handled EXTERNALLY via .collect()
+
+        For chain = [(start, outer_step, outer_join), (outer_step, inner_step, inner_join)]:
+          1. Decode "run_id/start/1//_i=N" -> run_id, outer_foreach_task_id="1", outer_split=N
+          2. Run outer_step at task_id "1-N" with input = "run_id/start/1"
+          3. Read outer_step's num_splits
+          4. For each _i in range(num_splits):
+               Run inner_step at task_id "1-N-{_i}"
+               Append inner_step path to results
+          5. Run inner_join at task_id "1-N-join"
+          6. return inner_join path
+        """
+        extra = self._tags_args_code()
+        _IDX = ["_i", "_j", "_k", "_l", "_m"]
+
+        # Use a list to collect lines (allows nested function to append to it)
+        result_lines: List[str] = []
+
+        # Decode outer DynamicOutput value
+        result_lines.append("_parts = %s.split('//_i=')" % param_name)
+        result_lines.append("_base_path = _parts[0]")
+        result_lines.append("_outer_split = int(_parts[1]) if len(_parts) > 1 else 0")
+        result_lines.append("run_id = _base_path.split('/')[0]")
+        # Outer foreach task_id is the last path component
+        result_lines.append("_outer_fe_tid = _base_path.rsplit('/', 1)[-1]")
+
+        # Work with chain[1:] since chain[0][0] (outer_foreach) was already run externally.
+        # Build the "inner chain" for emission: each element is (foreach, body, join).
+        # At depth 0 in the inner chain, the foreach step is chain[0][1] and its join
+        # is chain[1][2] (the innermost join at this depth).
+        #
+        # Re-build the compound chain as viewed from inside the compound op:
+        # For a 2-level chain [(A, B, Aj), (B, leaf, Bj)]:
+        #   inner chain = [(B, leaf, Bj)]
+        #   depth 0: foreach=B, body=leaf, join=Bj
+        #   task_id prefix: _outer_fe_tid + "-" + str(_outer_split)  <- B's task_id
+        #   input to B: _base_path  (A's task path)
+        #
+        # For a 3-level chain [(A, B, Aj), (B, C, Bj), (C, leaf, Cj)]:
+        #   inner chain = [(B, C, Bj), (C, leaf, Cj)]
+        #   depth 0: foreach=B, body=C, join=Bj
+        #     B task_id = _outer_fe_tid + "-" + str(_outer_split)
+        #     loop over B splits (_i):
+        #       depth 1: foreach=C, body=leaf, join=Cj
+        #         C task_id = B_task_id + "-" + str(_i)
+        #         ...
+        #       results_1.append(Cj_path)
+        #   Run Bj with results_1
+        #   return Bj_path
+
+        inner_chain = chain[1:]  # chain starting from the inner_foreach level
+
+        def _emit(depth: int, indent: str, parent_path_expr: str, parent_task_id_var: str, split_var: str) -> str:
+            """Emit code for inner_chain[depth].  Returns the join_path variable name."""
+            foreach_name, body_name, join_name = inner_chain[depth]
+            idx = _IDX[depth] if depth < len(_IDX) else "_idx_%d" % depth
+
+            foreach_node = self.graph[foreach_name]
+            foreach_env = self._extra_env_code(foreach_node)
+            join_node = self.graph[join_name]
+            join_env = self._extra_env_code(join_node)
+
+            # Task IDs and variable names unique per depth
+            fe_tid_var = "_fe_tid_%d" % depth
+            fe_path_var = "_fe_path_%d" % depth
+            results_var = "_res_%d" % depth
+            join_tid_var = "_join_tid_%d" % depth
+            join_path_var = "_join_path_%d" % depth
+
+            # Compute foreach step's task_id from parent
+            result_lines.append(
+                indent + '%s = %s + "-" + str(%s)'
+                % (fe_tid_var, parent_task_id_var, split_var)
+            )
+
+            # Run the foreach step
+            result_lines.append(indent + "%s = _run_step(" % fe_path_var)
+            result_lines.append(indent + "    context, %r, run_id, %s," % (foreach_name, parent_path_expr))
+            result_lines.append(indent + "    %s," % fe_tid_var)
+            result_lines.append(indent + "    retry_count=context.retry_number,")
+            result_lines.append(
+                indent + '    extra_args=["--split-index", str(%s)] + %s,' % (split_var, extra)
+            )
+            result_lines.append(indent + "    extra_env=%s," % foreach_env)
+            result_lines.append(indent + ")")
+            result_lines.append(indent + "_add_step_metadata(context, %s)" % fe_path_var)
+
+            # Read num_splits
+            result_lines.append(
+                indent + "_ns_%d = _get_foreach_splits(run_id, %r, %s)"
+                % (depth, foreach_name, fe_tid_var)
+            )
+
+            # Initialize results list
+            result_lines.append(indent + "%s = []" % results_var)
+            result_lines.append(indent + "for %s in range(_ns_%d):" % (idx, depth))
+
+            if depth == len(inner_chain) - 1:
+                # Innermost: body_name is a regular (non-foreach) step
+                body_node = self.graph[body_name]
+                body_env = self._extra_env_code(body_node)
+                body_tid_var = "_body_tid_%d" % depth
+                body_path_var = "_body_path_%d" % depth
+                result_lines.append(indent + '    %s = %s + "-" + str(%s)' % (body_tid_var, fe_tid_var, idx))
+                result_lines.append(indent + "    %s = _run_step(" % body_path_var)
+                result_lines.append(indent + "        context, %r, run_id, %s," % (body_name, fe_path_var))
+                result_lines.append(indent + "        %s," % body_tid_var)
+                result_lines.append(indent + "        retry_count=context.retry_number,")
+                result_lines.append(
+                    indent + '        extra_args=["--split-index", str(%s)] + %s,' % (idx, extra)
+                )
+                result_lines.append(indent + "        extra_env=%s," % body_env)
+                result_lines.append(indent + "    )")
+                result_lines.append(indent + "    _add_step_metadata(context, %s)" % body_path_var)
+                result_lines.append(indent + "    %s.append(%s)" % (results_var, body_path_var))
+            else:
+                # body is itself a foreach step: recurse (body_name == inner_chain[depth+1][0])
+                inner_join_var = _emit(depth + 1, indent + "    ", fe_path_var, fe_tid_var, idx)
+                result_lines.append(indent + "    %s.append(%s)" % (results_var, inner_join_var))
+
+            # After loop: run join
+            result_lines.append(indent + "from metaflow.util import compress_list")
+            result_lines.append(indent + "_ji_%d = compress_list(%s)" % (depth, results_var))
+            result_lines.append(indent + '%s = %s + "-join"' % (join_tid_var, fe_tid_var))
+            result_lines.append(indent + "%s = _run_step(" % join_path_var)
+            result_lines.append(indent + "    context, %r, run_id, _ji_%d," % (join_name, depth))
+            result_lines.append(indent + "    %s," % join_tid_var)
+            result_lines.append(indent + "    retry_count=context.retry_number,")
+            result_lines.append(indent + "    extra_args=%s," % extra)
+            result_lines.append(indent + "    extra_env=%s," % join_env)
+            result_lines.append(indent + ")")
+            result_lines.append(indent + "_add_step_metadata(context, %s)" % join_path_var)
+            return join_path_var
+
+        # Emit depth 0 of the inner chain.
+        # At depth 0: the foreach step is inner_chain[0][0], its input is _base_path,
+        # and its task_id prefix is _outer_fe_tid with split index _outer_split.
+        final_var = _emit(0, "", "_base_path", "_outer_fe_tid", "_outer_split")
+        result_lines.append("return %s" % final_var)
+        return result_lines
+
     # ── Job body ───────────────────────────────────────────────────────────────
 
     def _render_job(self) -> str:
@@ -901,41 +1157,93 @@ class DagsterCompiler:
     def _generate_job_body(self) -> str:
         """
         Walk the graph BFS and emit assignment statements.
-        var_map: step_name → Python expression for its output.
+        var_map: step_name -> Python expression for its output.
+
+        For nested foreach chains (depth > 1), steps inside the chain are handled
+        by the compound op and are therefore skipped in the top-level job body.
+        The compound op is wired via .map() on the outer foreach's DynamicOutput
+        and its result (the inner join's task path) is used by .collect() for the
+        outer join.
         """
         lines: List[str] = []
         var_map: Dict[str, str] = {}
 
+        # Build foreach chain info to identify nested steps that are handled
+        # by compound ops and must be skipped in the top-level job body.
+        chains = self._foreach_chains()
+
+        # nested_body_steps: step names that are the body of a foreach in a nested chain
+        # nested_inner_joins: the inner join steps that are inside compound ops
+        # For each nested chain (depth > 1):
+        #   - chain[0] = (outer_foreach, outer_body=inner_foreach, outer_join)
+        #   - chain[1..] = (inner_foreach, inner_body, inner_join), ...
+        # The compound op replaces outer_body (and everything inside the chain from chain[1:])
+        # In the job body:
+        #   - outer_foreach: still emitted normally (DynamicOut)
+        #   - outer_body..inner_join: all SKIPPED (inside compound op)
+        #   - outer_join: emitted with .collect() on the compound op's mapped output
+        #   - compound op result var is stored under outer_body name for the join lookup
+
+        # steps_in_compound: set of step names handled inside some compound op
+        steps_in_compound: set = set()
+        # compound_parent_for_join: outer_join -> outer_foreach name
+        # (so we know to use compound_op for the .collect())
+        compound_info: Dict[str, str] = {}  # outer_join_name -> outer_foreach_name
+
+        for outer_name, chain in chains.items():
+            if len(chain) > 1:
+                # The outer_body is chain[0][1], which is itself a foreach step.
+                # All steps from chain[1] onward (the inner chain) are inside the compound op.
+                outer_foreach_name, outer_body_name, outer_join_name = chain[0]
+                # Skip: outer_body and everything deeper
+                steps_in_compound.add(outer_body_name)
+                for d in range(1, len(chain)):
+                    _, body_n, join_n = chain[d]
+                    steps_in_compound.add(body_n)
+                    steps_in_compound.add(join_n)
+                # outer_join uses compound op result
+                compound_info[outer_join_name] = outer_foreach_name
+
         def _emit(node) -> None:
             if node.name in var_map:
                 return
-            # Ensure parents are emitted first (except start which has no parents)
+            # Ensure parents are emitted first
             for p in node.in_funcs:
-                if p not in var_map:
+                if p not in var_map and p not in steps_in_compound:
                     _emit(self.graph[p])
+
+            # Skip steps handled inside compound ops
+            if node.name in steps_in_compound:
+                return
 
             op_call = self._op_name(node.name)
             ntype = node.type
 
-            # ── start step (always no-arg call; outputs depend on type) ────────
+            # ── start step ────────────────────────────────────────────────────
             if node.name == "start":
-                var = f"r_start"
-                lines.append(f"{var} = {op_call}()")
+                var = "r_start"
+                lines.append("%s = %s()" % (var, op_call))
                 var_map["start"] = var
                 if ntype == "split":
                     for branch in node.out_funcs:
-                        var_map[f"_branch_{branch}"] = f'{var}.{branch}'
-                # foreach: downstream uses .map() on var
+                        var_map["_branch_%s" % branch] = "%s.%s" % (var, branch)
+                elif ntype == "foreach" and "start" in chains and len(chains["start"]) > 1:
+                    # Nested foreach: wire compound op via .map()
+                    compound_name = self._compound_op_name("start")
+                    compound_var = "r_start__body"
+                    lines.append("%s = %s.map(%s)" % (compound_var, var, compound_name))
+                    outer_body_name = chains["start"][0][1]
+                    var_map[outer_body_name] = compound_var
                 return
 
-            # ── end step ────────────────────────────────────────────────────────
+            # ── end step ──────────────────────────────────────────────────────
             if ntype == "end":
                 pvar = self._resolve_input(node, var_map)
-                lines.append(f"{op_call}({pvar})")
+                lines.append("%s(%s)" % (op_call, pvar))
                 var_map[node.name] = "_end"
                 return
 
-            # ── linear step ─────────────────────────────────────────────────────
+            # ── linear step ───────────────────────────────────────────────────
             if ntype == "linear":
                 parent_is_foreach = any(
                     self.graph[p].type == "foreach"
@@ -943,42 +1251,57 @@ class DagsterCompiler:
                     for p in node.in_funcs
                 )
                 if parent_is_foreach:
-                    # foreach body: use .map()
                     foreach_parent = next(
                         p for p in node.in_funcs
                         if self.graph[p].type == "foreach"
                         or (p == "start" and self.graph["start"].type == "foreach")
                     )
+                    # Check if this foreach_parent has a compound op (nested chain)
+                    outer_foreach_name = foreach_parent
+                    if outer_foreach_name in chains and len(chains[outer_foreach_name]) > 1:
+                        # This body step is the first outer body (itself a foreach) —
+                        # it should already be in steps_in_compound and thus skipped.
+                        # If we get here something is wrong; emit a comment and skip.
+                        var_map[node.name] = "None  # handled by compound op"
+                        return
                     dyn_var = var_map[foreach_parent]
-                    var = f"r_{node.name}"
-                    lines.append(f"{var} = {dyn_var}.map({op_call})")
+                    var = "r_%s" % node.name
+                    lines.append("%s = %s.map(%s)" % (var, dyn_var, op_call))
                     var_map[node.name] = var
                 else:
                     pvar = self._resolve_input(node, var_map)
-                    var = f"r_{node.name}"
-                    lines.append(f"{var} = {op_call}({pvar})")
+                    var = "r_%s" % node.name
+                    lines.append("%s = %s(%s)" % (var, op_call, pvar))
                     var_map[node.name] = var
                 return
 
-            # ── split step ──────────────────────────────────────────────────────
+            # ── split step ────────────────────────────────────────────────────
             if ntype == "split":
                 pvar = self._resolve_input(node, var_map)
-                var = f"r_{node.name}"
-                lines.append(f"{var} = {op_call}({pvar})")
+                var = "r_%s" % node.name
+                lines.append("%s = %s(%s)" % (var, op_call, pvar))
                 var_map[node.name] = var
                 for branch in node.out_funcs:
-                    var_map[f"_branch_{branch}"] = f'{var}.{branch}'
+                    var_map["_branch_%s" % branch] = "%s.%s" % (var, branch)
                 return
 
-            # ── foreach step ────────────────────────────────────────────────────
+            # ── foreach step ──────────────────────────────────────────────────
             if ntype == "foreach":
                 pvar = self._resolve_input(node, var_map)
-                var = f"r_{node.name}"
-                lines.append(f"{var} = {op_call}({pvar})")
+                var = "r_%s" % node.name
+                lines.append("%s = %s(%s)" % (var, op_call, pvar))
                 var_map[node.name] = var
+                # If this foreach has a nested chain, wire the compound op via .map()
+                if node.name in chains and len(chains[node.name]) > 1:
+                    compound_name = self._compound_op_name(node.name)
+                    compound_var = "r_%s__body" % node.name
+                    lines.append("%s = %s.map(%s)" % (compound_var, var, compound_name))
+                    # The outer_join will use compound_var.collect(); store under outer_body name
+                    outer_body_name = chains[node.name][0][1]
+                    var_map[outer_body_name] = compound_var
                 return
 
-            # ── join step ────────────────────────────────────────────────────────
+            # ── join step ─────────────────────────────────────────────────────
             if ntype == "join":
                 is_foreach_join = bool(
                     node.split_parents
@@ -991,21 +1314,25 @@ class DagsterCompiler:
                     )
                 )
                 if is_foreach_join:
-                    # collect dynamic results
                     body_step = node.in_funcs[0]
-                    dyn_var = var_map[body_step]
-                    var = f"r_{node.name}"
-                    lines.append(f"{var} = {op_call}({dyn_var}.collect())")
+                    if body_step in steps_in_compound:
+                        # This is the outer join of a nested foreach chain.
+                        # The compound op's mapped result is stored under the outer foreach's
+                        # body step name (chain[0][1]) which is also the inner foreach name.
+                        # node.split_parents[-1] is the outer foreach that feeds this join.
+                        outer_foreach_name = node.split_parents[-1]
+                        outer_body_name = chains[outer_foreach_name][0][1]
+                        dyn_var = var_map.get(outer_body_name, "r_%s__body" % outer_foreach_name)
+                    else:
+                        dyn_var = var_map.get(body_step, "r_%s" % body_step)
+                    var = "r_%s" % node.name
+                    lines.append("%s = %s(%s.collect())" % (var, op_call, dyn_var))
                     var_map[node.name] = var
                 else:
-                    # regular split-join: use the branch op outputs, not the split op outputs
-                    in_vars = [
-                        var_map.get(p, p)
-                        for p in node.in_funcs
-                    ]
+                    in_vars = [var_map.get(p, p) for p in node.in_funcs]
                     args = ", ".join(in_vars)
-                    var = f"r_{node.name}"
-                    lines.append(f"{var} = {op_call}({args})")
+                    var = "r_%s" % node.name
+                    lines.append("%s = %s(%s)" % (var, op_call, args))
                     var_map[node.name] = var
                 return
 
