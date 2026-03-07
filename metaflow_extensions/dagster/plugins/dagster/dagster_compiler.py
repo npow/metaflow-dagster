@@ -180,7 +180,7 @@ def _run_step(
 ) -> str:
     """Execute one Metaflow step. Returns its full task pathspec."""
     code_package_cache = _run_step.__dict__.setdefault(
-        "_code_package_cache", {{"metadata": None, "sha": None, "url": None}}
+        "_code_package_cache", {{"metadata": None, "sha": None, "url": None, "local_path": None}}
     )
 
     def _ensure_code_package():
@@ -193,6 +193,7 @@ def _run_step(
                 code_package_cache["metadata"],
                 code_package_cache["sha"],
                 code_package_cache["url"],
+                code_package_cache["local_path"],
             )
 
         import re
@@ -259,16 +260,21 @@ def _run_step(
             code_package_cache["metadata"] = package_metadata
             code_package_cache["sha"] = package_sha
             code_package_cache["url"] = package_url
-        finally:
+            # Keep the local tarball alive so TarballStager (used by @sandbox)
+            # can deliver the code package via backend.upload() without S3.
+            code_package_cache["local_path"] = package_path
+        except Exception:
             try:
                 os.unlink(package_path)
             except Exception:
                 pass
+            raise
 
         return (
             code_package_cache["metadata"],
             code_package_cache["sha"],
             code_package_cache["url"],
+            code_package_cache["local_path"],
         )
 
     class _CLIArgs:
@@ -332,16 +338,23 @@ def _run_step(
 
     for spec in STEP_DECORATOR_SPECS.get(step_name, []):
         deco, _ = extract_step_decorator_from_decospec(spec)
+        # Set instance attributes that step_init would normally provide.
+        # runtime_step_cli (e.g. SandboxDecorator) accesses _step_name for dep staging.
+        if not hasattr(deco, "_step_name"):
+            deco._step_name = step_name
         if (
             hasattr(deco, "package_metadata")
             and hasattr(deco, "package_sha")
             and hasattr(deco, "package_url")
             and getattr(deco, "package_metadata", None) is None
         ):
-            package_metadata, package_sha, package_url = _ensure_code_package()
+            package_metadata, package_sha, package_url, package_local_path = _ensure_code_package()
             deco.package_metadata = package_metadata
             deco.package_sha = package_sha
             deco.package_url = package_url
+            # Propagate to the class so TarballStager delivery works for @sandbox.
+            if package_local_path and hasattr(type(deco), "package_local_path"):
+                type(deco).package_local_path = package_local_path
         deco.runtime_step_cli(cli_args, retry_count, max_user_code_retries, None)
 
     cmd = cli_args.get_args()
