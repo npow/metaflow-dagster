@@ -17,3 +17,5 @@ htmlcov/
 *.so
 /tmp/
 .metaflow/
+coverage.xml
+htmlcov/

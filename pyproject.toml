@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metaflow-dagster"
-version = "0.3.3"
+version = "0.3.4"
 description = "Metaflow extension to compile and deploy flows as Dagster jobs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,7 +19,30 @@ test = [
     "dagster-webserver",
     "pytest>=7",
     "pytest-timeout",
+    "pytest-cov",
 ]
+lint = [
+    "ruff",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes (unused imports, undefined names, etc.)
+    "UP",   # pyupgrade (modernize syntax for target Python version)
+    "I",    # isort
+]
+ignore = [
+    "E501",  # line too long (enforced by formatter, not checker)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Preamble string contains generated Python code — skip UP checks on it
+"dagster_compiler.py" = []
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -36,3 +59,12 @@ log_cli_level = "INFO"
 markers = [
     "e2e: end-to-end tests that compile flows and execute them via dagster job execute",
 ]
+addopts = "--cov=metaflow_extensions/dagster/plugins/dagster --cov-report=term-missing --cov-report=xml"
+
+[tool.coverage.run]
+source = ["metaflow_extensions/dagster/plugins/dagster"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

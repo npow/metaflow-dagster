@@ -19,15 +19,12 @@ Generated file structure:
 """
 
 import os
-import sys
 from collections import deque
-from textwrap import dedent, indent
-from typing import Dict, List, Optional
+from textwrap import dedent
 
 from metaflow.decorators import flow_decorators
 from metaflow.parameters import deploy_time_eval
 from metaflow.util import dict_to_cli_options
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Preamble template
@@ -58,7 +55,6 @@ from dagster import (
     DynamicOutput,
     In,
     MetadataValue,
-    Nothing,
     OpExecutionContext,
     Out,
     Output,
@@ -66,9 +62,9 @@ from dagster import (
     ScheduleDefinition,
     job,
     op,
-    schedule,
 )
 from metaflow.decorators import extract_step_decorator_from_decospec
+from metaflow.util import compress_list
 
 # ── Flow constants ─────────────────────────────────────────────────────────────
 FLOW_FILE = {flow_file!r}
@@ -82,7 +78,6 @@ METAFLOW_STEP_ENV: Dict[str, str] = {step_env!r}
 
 # Per-step runtime decorator specs and retry limits used to honor runtime_step_cli hooks.
 STEP_DECORATOR_SPECS: Dict[str, List[str]] = {step_decorator_specs!r}
-STEP_MAX_USER_CODE_RETRIES: Dict[str, int] = {step_max_user_code_retries!r}
 STEP_WITH_DECORATORS: Dict[str, List[str]] = {step_with_decorators!r}
 
 
@@ -162,10 +157,10 @@ def _run_init(
         + METAFLOW_TOP_ARGS
         + ["init", "--run-id", run_id, "--task-id", params_task_id]
     )
-    extra: Dict[str, str] = {{}}
-    for k, v in (parameters or {{}}).items():
-        env_key = "METAFLOW_INIT_" + k.upper().replace("-", "_")
-        extra[env_key] = str(v)
+    extra = {{
+        "METAFLOW_INIT_" + k.upper().replace("-", "_"): str(v)
+        for k, v in (parameters or {{}}).items()
+    }}
     _run_cmd(context, cmd, extra or None)
     return f"{{run_id}}/_parameters/{{params_task_id}}"
 
@@ -342,9 +337,9 @@ def _run_step(
             deco._step_name = step_name
         if (
             hasattr(deco, "package_metadata")
+            and deco.package_metadata is None
             and hasattr(deco, "package_sha")
             and hasattr(deco, "package_url")
-            and getattr(deco, "package_metadata", None) is None
         ):
             package_metadata, package_sha, package_url, package_local_path = _ensure_code_package()
             deco.package_metadata = package_metadata
@@ -445,6 +440,9 @@ def _add_step_metadata(
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DagsterCompiler:
+    # Loop index variable names used inside compound op bodies (one per nesting level)
+    _LOOP_IDX = ["_i", "_j", "_k", "_l", "_m"]
+
     def __init__(
         self,
         job_name: str,
@@ -456,13 +454,11 @@ class DagsterCompiler:
         flow_datastore,
         event_logger,
         monitor,
-        tags: List[str],
-        with_decorators: List[str],
-        namespace: Optional[str],
-        username: str,
-        max_workers: int,
-        workflow_timeout: Optional[int],
-        step_env: Dict[str, str],
+        tags: list[str],
+        with_decorators: list[str],
+        namespace: str | None,
+        workflow_timeout: int | None,
+        step_env: dict[str, str],
     ):
         self.job_name = job_name
         self.graph = graph
@@ -476,8 +472,6 @@ class DagsterCompiler:
         self.tags = tags
         self.with_decorators = with_decorators
         self.namespace = namespace
-        self.username = username
-        self.max_workers = max_workers
         self.workflow_timeout = workflow_timeout
         self.step_env = step_env
 
@@ -485,8 +479,8 @@ class DagsterCompiler:
         self.parameters = self._extract_parameters()
         self.schedule = self._extract_schedule()
 
-        self._topo_cache: Optional[List] = None
-        self._foreach_chains_cache: Optional[Dict[str, List]] = None
+        self._topo_cache: list | None = None
+        self._foreach_chains_cache: dict[str, list] | None = None
 
     # ── Public ─────────────────────────────────────────────────────────────────
 
@@ -495,24 +489,13 @@ class DagsterCompiler:
         config = self._render_config_class()
         if config:
             parts.append(config)
-        # Determine which steps are handled inside compound ops and should not
-        # get their own top-level @op definition.
         chains = self._foreach_chains()
-        steps_in_compound: set = set()
-        for outer_name, chain in chains.items():
-            if len(chain) > 1:
-                for d in range(1, len(chain)):
-                    _, body_n, join_n = chain[d]
-                    steps_in_compound.add(body_n)
-                    steps_in_compound.add(join_n)
-                # The outer body (chain[0][1]) is itself a foreach step; it is also
-                # handled inside the compound op body, NOT emitted as a standalone op.
-                steps_in_compound.add(chain[0][1])
+        steps_in_compound = self._steps_in_compound()
         for node in self._topological_order():
             if node.name not in steps_in_compound:
                 parts.append(self._render_op(node))
         # Emit compound ops for any nested foreach chains
-        for outer_name, chain in chains.items():
+        for chain in chains.values():
             if len(chain) > 1:
                 parts.append(self._render_nested_foreach_compound_op(chain))
         parts.append(self._render_job())
@@ -524,6 +507,7 @@ class DagsterCompiler:
     # ── Preamble ───────────────────────────────────────────────────────────────
 
     def _render_preamble(self) -> str:
+        step_decorator_specs, step_with_decorators = self._build_step_decorator_info()
         return _PREAMBLE.format(
             flow_name=self.flow_name,
             job_name=self.job_name,
@@ -532,57 +516,48 @@ class DagsterCompiler:
             output_file="<output.py>",
             top_args=self._build_top_args(),
             step_env=self.step_env,
-            step_decorator_specs=self._build_step_decorator_specs(),
-            step_max_user_code_retries=self._build_step_max_user_code_retries(),
-            step_with_decorators=self._build_step_with_decorators(),
+            step_decorator_specs=step_decorator_specs,
+            step_with_decorators=step_with_decorators,
         )
 
-    def _build_top_args(self) -> List[str]:
-        top_opts_dict: Dict = {}
+    def _build_top_args(self) -> list[str]:
+        top_opts_dict: dict = {}
         for deco in flow_decorators(self.flow):
             top_opts_dict.update(deco.get_top_level_options())
         top_opts = list(dict_to_cli_options(top_opts_dict))
         args = top_opts + [
             "--quiet",
             "--no-pylint",
-            "--metadata=%s" % self.metadata.TYPE,
-            "--environment=%s" % self.environment.TYPE,
-            "--datastore=%s" % self.flow_datastore.TYPE,
-            "--datastore-root=%s" % self.flow_datastore.datastore_root,
-            "--event-logger=%s" % self.event_logger.TYPE,
-            "--monitor=%s" % self.monitor.TYPE,
+            f"--metadata={self.metadata.TYPE}",
+            f"--environment={self.environment.TYPE}",
+            f"--datastore={self.flow_datastore.TYPE}",
+            f"--datastore-root={self.flow_datastore.datastore_root}",
+            f"--event-logger={self.event_logger.TYPE}",
+            f"--monitor={self.monitor.TYPE}",
         ]
         if self.namespace:
-            args.append("--namespace=%s" % self.namespace)
+            args.append(f"--namespace={self.namespace}")
         return args
 
-    def _build_step_decorator_specs(self) -> Dict[str, List[str]]:
-        specs = {}
+    def _build_step_decorator_info(self) -> "tuple[dict[str, list[str]], dict[str, list[str]]]":
+        """Return (decorator_specs, with_decorators) dicts in a single pass over the graph."""
+        specs: dict[str, list[str]] = {}
+        withs: dict[str, list[str]] = {}
         for node in self._topological_order():
             step_specs = [d.make_decorator_spec() for d in node.decorators]
             step_specs.extend(self.with_decorators)
             specs[node.name] = step_specs
-        return specs
-
-    def _build_step_max_user_code_retries(self) -> Dict[str, int]:
-        retries = {}
-        for node in self._topological_order():
-            max_retries, _ = self._get_retry_info(node)
-            retries[node.name] = max_retries
-        return retries
-
-    def _build_step_with_decorators(self) -> Dict[str, List[str]]:
-        return {node.name: list(self.with_decorators) for node in self._topological_order()}
+            withs[node.name] = list(self.with_decorators)
+        return specs, withs
 
     # ── Config class ───────────────────────────────────────────────────────────
 
-    def _extract_parameters(self) -> List[Dict]:
+    def _extract_parameters(self) -> list[dict]:
         params = []
-        for var, param in self.flow._get_parameters():
+        for _, param in self.flow._get_parameters():
             default = deploy_time_eval(param.kwargs.get("default"))
             params.append({
                 "name": param.name,
-                "var": var,
                 "default": default,
                 "help": param.kwargs.get("help", ""),
                 "type": type(default).__name__ if default is not None else "str",
@@ -595,20 +570,29 @@ class DagsterCompiler:
         lines = [f"class {self.flow_name}Config(Config):"]
         for p in self.parameters:
             default = p["default"]
-            type_name = p["type"]
-            if type_name == "bool":
-                ann, val = "bool", default
-            elif type_name == "int":
-                ann, val = "int", default
-            elif type_name == "float":
-                ann, val = "float", default
-            else:
-                ann, val = "str", str(default) if default is not None else ""
+            ann = p["type"]  # "bool", "int", "float", or "str"
+            val = default if ann != "str" else (str(default) if default is not None else "")
             comment = f"  # {p['help']}" if p["help"] else ""
             lines.append(f"    {p['name']}: {ann} = {val!r}{comment}")
         return "\n".join(lines)
 
     # ── Op rendering ───────────────────────────────────────────────────────────
+
+    def _steps_in_compound(self) -> set:
+        """Return step names that are handled inside compound ops.
+
+        Steps in this set must NOT be emitted as standalone @op definitions,
+        nor visited in the top-level job body — they are fully contained
+        inside the compound op generated for each nested foreach chain.
+        """
+        result = set()
+        for chain in self._foreach_chains().values():
+            if len(chain) > 1:
+                result.add(chain[0][1])  # outer_body (itself a foreach step)
+                for _, body_n, join_n in chain[1:]:
+                    result.add(body_n)
+                    result.add(join_n)
+        return result
 
     def _topological_order(self):
         if self._topo_cache is None:
@@ -628,6 +612,15 @@ class DagsterCompiler:
 
     def _op_name(self, step_name: str) -> str:
         return f"op_{step_name}"
+
+    def _ins_spec(self, name: str, type_: str = "str") -> str:
+        """Return the Dagster ins= dict literal string for a single named input."""
+        return f'{{"{name}": In({type_})}}'
+
+    def _is_foreach_join(self, node) -> bool:
+        """Return True if *node* is a join that collects dynamic foreach outputs."""
+        split_parent = node.split_parents[-1] if node.split_parents else None
+        return split_parent is not None and self.graph[split_parent].type == "foreach"
 
     def _render_op(self, node) -> str:
         # The "start" step is special regardless of its graph type
@@ -652,22 +645,20 @@ class DagsterCompiler:
     def _get_retry_info(self, node):
         """Returns (max_retries, delay_seconds_or_None) from @retry decorator."""
         max_retries = 0
+        delay_seconds = None
         for deco in node.decorators:
             try:
                 user_retries, _ = deco.step_task_retry_count()
                 max_retries = max(max_retries, user_retries)
             except Exception:
                 pass
-        delay_seconds = None
-        for deco in node.decorators:
-            if deco.name == "retry":
+            if deco.name == "retry" and delay_seconds is None:
                 mins = deco.attributes.get("minutes_between_retries", 0)
                 if mins:
                     delay_seconds = int(mins) * 60
-                break
         return max_retries, delay_seconds
 
-    def _get_timeout_seconds(self, node) -> Optional[int]:
+    def _get_timeout_seconds(self, node) -> int | None:
         """Returns timeout in seconds from @timeout decorator, or None."""
         for deco in node.decorators:
             if deco.name == "timeout":
@@ -679,7 +670,7 @@ class DagsterCompiler:
                     return total
         return None
 
-    def _get_env_vars(self, node) -> Dict[str, str]:
+    def _get_env_vars(self, node) -> dict[str, str]:
         """Returns env vars dict from @environment decorator."""
         for deco in node.decorators:
             if deco.name == "environment":
@@ -722,6 +713,7 @@ class DagsterCompiler:
         )
         tags_code = repr(self.tags)
         env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
 
         # The common body: init then step
         common = (
@@ -731,20 +723,21 @@ class DagsterCompiler:
             f'    task_path = _run_step(\n'
             f'        context, "start", run_id, params_path, "1",\n'
             f'        retry_count=context.retry_number,\n'
-            f'        max_user_code_retries=STEP_MAX_USER_CODE_RETRIES["start"],\n'
+            f'        max_user_code_retries={max_retries},\n'
             f'        tags={tags_code},\n'
             f'        extra_env={env_code},\n'
             f'    )\n'
         )
 
-        if ntype in ("start", "linear"):
+        op_name = self._op_name("start")
+        if ntype == "start":
             deco = self._op_decorator_str(node, out_spec="Out(str)")
             return (
                 f'{deco}\n'
-                f'def {self._op_name("start")}(context: OpExecutionContext{config_ann}) -> str:\n'
+                f'def {op_name}(context: OpExecutionContext{config_ann}) -> str:\n'
                 + common
-                + f'    _add_step_metadata(context, task_path)\n'
-                + f'    return task_path\n'
+                + '    _add_step_metadata(context, task_path)\n'
+                + '    return task_path\n'
             )
         elif ntype == "split":
             branches = node.out_funcs
@@ -756,7 +749,7 @@ class DagsterCompiler:
             )
             return (
                 f'{deco}\n'
-                f'def {self._op_name("start")}(context: OpExecutionContext{config_ann}):\n'
+                f'def {op_name}(context: OpExecutionContext{config_ann}):\n'
                 + common
                 + f'    _add_step_metadata(context, task_path, output_name="{first_branch}")\n'
                 + yields
@@ -765,12 +758,12 @@ class DagsterCompiler:
             deco = self._op_decorator_str(node, out_spec="DynamicOut(str)")
             return (
                 f'{deco}\n'
-                f'def {self._op_name("start")}(context: OpExecutionContext{config_ann}):\n'
+                f'def {op_name}(context: OpExecutionContext{config_ann}):\n'
                 + common
-                + f'    _add_step_metadata(context, task_path)\n'
-                + f'    num_splits = _get_foreach_splits(run_id, "start", "1")\n'
-                + f'    for _i in range(num_splits):\n'
-                + f'        yield DynamicOutput(f"{{task_path}}//_i={{_i}}", mapping_key=str(_i))\n'
+                + '    _add_step_metadata(context, task_path)\n'
+                + '    num_splits = _get_foreach_splits(run_id, "start", "1")\n'
+                + '    for _i in range(num_splits):\n'
+                + '        yield DynamicOutput(f"{task_path}//_i={_i}", mapping_key=str(_i))\n'
             )
         else:
             raise NotImplementedError(f"start step with type {ntype!r}")
@@ -782,13 +775,13 @@ class DagsterCompiler:
         tags = repr(self.tags)
         env_code = self._extra_env_code(node)
         max_retries, _ = self._get_retry_info(node)
-        ins_spec = '{"' + in_name + '": In(str)}'
+        ins_spec = self._ins_spec(in_name)
         deco = self._op_decorator_str(node, ins_spec=ins_spec)
         return dedent(f"""\
             {deco}
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str) -> None:
                 run_id = {in_name}.split("/")[0]
-                _run_step(context, "end", run_id, {in_name}, "1",
+                _run_step(context, "{node.name}", run_id, {in_name}, "1",
                     retry_count=context.retry_number, max_user_code_retries={max_retries},
                     tags={tags}, extra_env={env_code})
         """)
@@ -796,15 +789,12 @@ class DagsterCompiler:
     # linear op ────────────────────────────────────────────────────────────────
 
     def _render_linear_op(self, node) -> str:
-        parent_is_foreach = any(
-            self.graph[p].type == "foreach" or (p == "start" and self.graph["start"].type == "foreach")
-            for p in node.in_funcs
-        )
+        parent_is_foreach = any(self.graph[p].type == "foreach" for p in node.in_funcs)
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
         tags = repr(self.tags)
         env_code = self._extra_env_code(node)
         max_retries, _ = self._get_retry_info(node)
-        ins_spec = '{"' + in_name + '": In(str)}'
+        ins_spec = self._ins_spec(in_name)
         deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="Out(str)")
 
         if parent_is_foreach:
@@ -847,7 +837,7 @@ class DagsterCompiler:
         branches = node.out_funcs
         first_branch = branches[0]
         out_spec = "{" + ", ".join(f'"{b}": Out(str)' for b in branches) + "}"
-        ins_spec = '{"' + in_name + '": In(str)}'
+        ins_spec = self._ins_spec(in_name)
         tags = repr(self.tags)
         env_code = self._extra_env_code(node)
         max_retries, _ = self._get_retry_info(node)
@@ -869,27 +859,20 @@ class DagsterCompiler:
     # join op ──────────────────────────────────────────────────────────────────
 
     def _render_join_op(self, node) -> str:
-        is_foreach_join = bool(
-            node.split_parents
-            and (
-                self.graph[node.split_parents[-1]].type == "foreach"
-                or node.split_parents[-1] == "start" and self.graph["start"].type == "foreach"
-            )
-        )
+        is_foreach_join = self._is_foreach_join(node)
         tags = repr(self.tags)
         env_code = self._extra_env_code(node)
         max_retries, _ = self._get_retry_info(node)
 
         if is_foreach_join:
             in_name = "foreach_results"
-            ins_spec = '{"foreach_results": In(list)}'
+            ins_spec = self._ins_spec("foreach_results", "list")
             deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="Out(str)")
             return dedent(f"""\
                 {deco}
                 def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: list) -> str:
                     run_id = {in_name}[0].split("/")[0]
-                    from metaflow.util import compress_list
-                    clean = [{in_name}[i].split("//_i=")[0] for i in range(len({in_name}))]
+                    clean = [p.split("//_i=")[0] for p in {in_name}]
                     input_paths = compress_list(clean)
                     task_path = _run_step(context, "{node.name}", run_id, input_paths, "1",
                         retry_count=context.retry_number, max_user_code_retries={max_retries},
@@ -908,7 +891,6 @@ class DagsterCompiler:
                 {deco}
                 def {self._op_name(node.name)}(context: OpExecutionContext, {args}) -> str:
                     run_id = {node.in_funcs[0]}.split("/")[0]
-                    from metaflow.util import compress_list
                     input_paths = compress_list({paths_list})
                     task_path = _run_step(context, "{node.name}", run_id, input_paths, "1",
                         retry_count=context.retry_number, max_user_code_retries={max_retries},
@@ -924,11 +906,8 @@ class DagsterCompiler:
         tags = repr(self.tags)
         env_code = self._extra_env_code(node)
         max_retries, _ = self._get_retry_info(node)
-        ins_spec = '{"' + in_name + '": In(str)}'
+        ins_spec = self._ins_spec(in_name)
         deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="DynamicOut(str)")
-        # Note: we use _i to avoid clashing with any user variable names
-        # The f-string in generated code: we must use non-f-string concat to avoid
-        # the compiler's own f-string from interpolating {_i} prematurely.
         return dedent(f"""\
             {deco}
             def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str):
@@ -939,17 +918,17 @@ class DagsterCompiler:
                 _add_step_metadata(context, task_path)
                 num_splits = _get_foreach_splits(run_id, "{node.name}", "1")
                 for _i in range(num_splits):
-                    yield DynamicOutput(task_path + "//_i=" + str(_i), mapping_key=str(_i))
+                    yield DynamicOutput(f"{{task_path}}//_i={{_i}}", mapping_key=str(_i))
         """)
 
     # ── Foreach chain analysis ─────────────────────────────────────────────────
 
-    def _foreach_chains(self) -> Dict[str, List]:
+    def _foreach_chains(self) -> dict[str, list]:
         if self._foreach_chains_cache is None:
             self._foreach_chains_cache = self._compute_foreach_chains()
         return self._foreach_chains_cache
 
-    def _compute_foreach_chains(self) -> Dict[str, List]:
+    def _compute_foreach_chains(self) -> dict[str, list]:
         """Return {outermost_foreach: chain} for every outermost foreach in the flow.
 
         Each chain is a list of (foreach_name, body_name, join_name) tuples ordered
@@ -957,13 +936,9 @@ class DagsterCompiler:
         so len(chain) == 1 for a simple (non-nested) foreach.
         """
         # foreach step name -> immediate body step name
-        foreach_body: Dict[str, str] = {}
+        foreach_body: dict[str, str] = {}
         for node in self._topological_order():
-            is_foreach = (
-                node.type == "foreach"
-                or (node.name == "start" and self.graph["start"].type == "foreach")
-            )
-            if is_foreach and node.out_funcs:
+            if node.type == "foreach" and node.out_funcs:
                 foreach_body[node.name] = node.out_funcs[0]
 
         # foreach steps that are themselves the body of another foreach
@@ -971,19 +946,20 @@ class DagsterCompiler:
         # outermost = foreach steps not nested inside another foreach
         outermost = [name for name in foreach_body if name not in nested_foreach]
 
-        chains: Dict[str, List] = {}
+        # Pre-build lookup: split_step_name -> join_step_name (avoids O(n²) inner scan)
+        split_to_join: dict[str, str] = {
+            node.split_parents[-1]: node.name
+            for node in self._topological_order()
+            if node.type == "join" and node.split_parents
+        }
+
+        chains: dict[str, list] = {}
         for outer in outermost:
-            chain: List = []
+            chain: list = []
             current = outer
             while True:
                 body = foreach_body[current]
-                # Find the join step whose split_parents[-1] == current
-                join = None
-                for node in self._topological_order():
-                    if node.type == "join" and node.split_parents:
-                        if node.split_parents[-1] == current:
-                            join = node.name
-                            break
+                join = split_to_join.get(current)
                 if join is None:
                     break
                 chain.append((current, body, join))
@@ -1000,9 +976,9 @@ class DagsterCompiler:
 
     def _compound_op_name(self, outer_foreach_name: str) -> str:
         """Name for the compound op that handles the body of an outer foreach."""
-        return "op_%s__body" % outer_foreach_name
+        return f"op_{outer_foreach_name}__body"
 
-    def _render_nested_foreach_compound_op(self, chain: List) -> str:
+    def _render_nested_foreach_compound_op(self, chain: list) -> str:
         """Generate a compound op for the body of an outer foreach in a nested chain.
 
         Dagster cannot have an op be downstream of more than one dynamic output
@@ -1022,17 +998,17 @@ class DagsterCompiler:
         outer_foreach_name = chain[0][0]
         compound_name = self._compound_op_name(outer_foreach_name)
         in_name = outer_foreach_name
-        ins_spec = '{"' + in_name + '": In(str)}'
+        ins_spec = self._ins_spec(in_name)
 
         body_lines = self._compound_op_body_lines(chain, param_name=in_name)
-        body_text = "\n".join("    " + line for line in body_lines)
+        body_text = "\n".join(f"    {line}" for line in body_lines)
         return (
-            "@op(ins=%s, out=Out(str))\n"
-            "def %s(context: OpExecutionContext, %s: str) -> str:\n"
-            "%s\n"
-        ) % (ins_spec, compound_name, in_name, body_text)
+            f"@op(ins={ins_spec}, out=Out(str))\n"
+            f"def {compound_name}(context: OpExecutionContext, {in_name}: str) -> str:\n"
+            f"{body_text}\n"
+        )
 
-    def _compound_op_body_lines(self, chain: List, param_name: str) -> List[str]:
+    def _compound_op_body_lines(self, chain: list, param_name: str) -> list[str]:
         """Generate body lines for a compound op that handles nested foreach.
 
         The compound op is the BODY used with .map() on the outermost foreach's
@@ -1057,25 +1033,23 @@ class DagsterCompiler:
           6. return inner_join path
         """
         tags_code = repr(self.tags)
-        _IDX = ["_i", "_j", "_k", "_l", "_m"]
 
-        # Use a list to collect lines (allows nested function to append to it)
-        result_lines: List[str] = []
+
+        result_lines: list[str] = []
 
         # Decode outer DynamicOutput value
-        result_lines.append("_parts = %s.split('//_i=')" % param_name)
+        result_lines.append(f"_parts = {param_name}.split('//_i=')")
         result_lines.append("_base_path = _parts[0]")
         result_lines.append("_outer_split = int(_parts[1]) if len(_parts) > 1 else 0")
         result_lines.append("run_id = _base_path.split('/')[0]")
-        # Outer foreach task_id is the last path component
         result_lines.append("_outer_fe_tid = _base_path.rsplit('/', 1)[-1]")
 
         inner_chain = chain[1:]  # chain starting from the inner_foreach level
 
-        def _emit(depth: int, indent: str, parent_path_expr: str, parent_task_id_var: str, split_var: str) -> str:
+        def _emit(depth: int, pfx: str, parent_path_expr: str, parent_task_id_var: str, split_var: str) -> str:
             """Emit code for inner_chain[depth].  Returns the join_path variable name."""
             foreach_name, body_name, join_name = inner_chain[depth]
-            idx = _IDX[depth] if depth < len(_IDX) else "_idx_%d" % depth
+            idx = self._LOOP_IDX[depth] if depth < len(self._LOOP_IDX) else f"_idx_{depth}"
 
             foreach_node = self.graph[foreach_name]
             foreach_env = self._extra_env_code(foreach_node)
@@ -1085,84 +1059,76 @@ class DagsterCompiler:
             join_max_retries, _ = self._get_retry_info(join_node)
 
             # Task IDs and variable names unique per depth
-            fe_tid_var = "_fe_tid_%d" % depth
-            fe_path_var = "_fe_path_%d" % depth
-            results_var = "_res_%d" % depth
-            join_tid_var = "_join_tid_%d" % depth
-            join_path_var = "_join_path_%d" % depth
+            fe_tid_var = f"_fe_tid_{depth}"
+            fe_path_var = f"_fe_path_{depth}"
+            results_var = f"_res_{depth}"
+            join_tid_var = f"_join_tid_{depth}"
+            join_path_var = f"_join_path_{depth}"
 
             # Compute foreach step's task_id from parent
-            result_lines.append(
-                indent + '%s = %s + "-" + str(%s)'
-                % (fe_tid_var, parent_task_id_var, split_var)
-            )
+            result_lines.append(f'{pfx}{fe_tid_var} = {parent_task_id_var} + "-" + str({split_var})')
 
             # Run the foreach step
-            result_lines.append(indent + "%s = _run_step(" % fe_path_var)
-            result_lines.append(indent + "    context, %r, run_id, %s," % (foreach_name, parent_path_expr))
-            result_lines.append(indent + "    %s," % fe_tid_var)
-            result_lines.append(indent + "    retry_count=context.retry_number,")
-            result_lines.append(indent + "    max_user_code_retries=%d," % foreach_max_retries)
-            result_lines.append(indent + "    tags=%s," % tags_code)
-            result_lines.append(indent + "    split_index=%s," % split_var)
-            result_lines.append(indent + "    extra_env=%s," % foreach_env)
-            result_lines.append(indent + ")")
-            result_lines.append(indent + "_add_step_metadata(context, %s)" % fe_path_var)
+            result_lines.append(f"{pfx}{fe_path_var} = _run_step(")
+            result_lines.append(f"{pfx}    context, {foreach_name!r}, run_id, {parent_path_expr},")
+            result_lines.append(f"{pfx}    {fe_tid_var},")
+            result_lines.append(f"{pfx}    retry_count=context.retry_number,")
+            result_lines.append(f"{pfx}    max_user_code_retries={foreach_max_retries},")
+            result_lines.append(f"{pfx}    tags={tags_code},")
+            result_lines.append(f"{pfx}    split_index={split_var},")
+            result_lines.append(f"{pfx}    extra_env={foreach_env},")
+            result_lines.append(f"{pfx})")
+            result_lines.append(f"{pfx}_add_step_metadata(context, {fe_path_var})")
 
             # Read num_splits
-            result_lines.append(
-                indent + "_ns_%d = _get_foreach_splits(run_id, %r, %s)"
-                % (depth, foreach_name, fe_tid_var)
-            )
+            result_lines.append(f"{pfx}_ns_{depth} = _get_foreach_splits(run_id, {foreach_name!r}, {fe_tid_var})")
 
-            # Initialize results list
-            result_lines.append(indent + "%s = []" % results_var)
-            result_lines.append(indent + "for %s in range(_ns_%d):" % (idx, depth))
+            # Loop over splits
+            result_lines.append(f"{pfx}{results_var} = []")
+            result_lines.append(f"{pfx}for {idx} in range(_ns_{depth}):")
 
             if depth == len(inner_chain) - 1:
                 # Innermost: body_name is a regular (non-foreach) step
                 body_node = self.graph[body_name]
                 body_env = self._extra_env_code(body_node)
                 body_max_retries, _ = self._get_retry_info(body_node)
-                body_tid_var = "_body_tid_%d" % depth
-                body_path_var = "_body_path_%d" % depth
-                result_lines.append(indent + '    %s = %s + "-" + str(%s)' % (body_tid_var, fe_tid_var, idx))
-                result_lines.append(indent + "    %s = _run_step(" % body_path_var)
-                result_lines.append(indent + "        context, %r, run_id, %s," % (body_name, fe_path_var))
-                result_lines.append(indent + "        %s," % body_tid_var)
-                result_lines.append(indent + "        retry_count=context.retry_number,")
-                result_lines.append(indent + "        max_user_code_retries=%d," % body_max_retries)
-                result_lines.append(indent + "        tags=%s," % tags_code)
-                result_lines.append(indent + "        split_index=%s," % idx)
-                result_lines.append(indent + "        extra_env=%s," % body_env)
-                result_lines.append(indent + "    )")
-                result_lines.append(indent + "    _add_step_metadata(context, %s)" % body_path_var)
-                result_lines.append(indent + "    %s.append(%s)" % (results_var, body_path_var))
+                body_tid_var = f"_body_tid_{depth}"
+                body_path_var = f"_body_path_{depth}"
+                result_lines.append(f'{pfx}    {body_tid_var} = {fe_tid_var} + "-" + str({idx})')
+                result_lines.append(f"{pfx}    {body_path_var} = _run_step(")
+                result_lines.append(f"{pfx}        context, {body_name!r}, run_id, {fe_path_var},")
+                result_lines.append(f"{pfx}        {body_tid_var},")
+                result_lines.append(f"{pfx}        retry_count=context.retry_number,")
+                result_lines.append(f"{pfx}        max_user_code_retries={body_max_retries},")
+                result_lines.append(f"{pfx}        tags={tags_code},")
+                result_lines.append(f"{pfx}        split_index={idx},")
+                result_lines.append(f"{pfx}        extra_env={body_env},")
+                result_lines.append(f"{pfx}    )")
+                result_lines.append(f"{pfx}    _add_step_metadata(context, {body_path_var})")
+                result_lines.append(f"{pfx}    {results_var}.append({body_path_var})")
             else:
                 # body is itself a foreach step: recurse (body_name == inner_chain[depth+1][0])
-                inner_join_var = _emit(depth + 1, indent + "    ", fe_path_var, fe_tid_var, idx)
-                result_lines.append(indent + "    %s.append(%s)" % (results_var, inner_join_var))
+                inner_join_var = _emit(depth + 1, pfx + "    ", fe_path_var, fe_tid_var, idx)
+                result_lines.append(f"{pfx}    {results_var}.append({inner_join_var})")
 
             # After loop: run join
-            result_lines.append(indent + "from metaflow.util import compress_list")
-            result_lines.append(indent + "_ji_%d = compress_list(%s)" % (depth, results_var))
-            result_lines.append(indent + '%s = %s + "-join"' % (join_tid_var, fe_tid_var))
-            result_lines.append(indent + "%s = _run_step(" % join_path_var)
-            result_lines.append(indent + "    context, %r, run_id, _ji_%d," % (join_name, depth))
-            result_lines.append(indent + "    %s," % join_tid_var)
-            result_lines.append(indent + "    retry_count=context.retry_number,")
-            result_lines.append(indent + "    max_user_code_retries=%d," % join_max_retries)
-            result_lines.append(indent + "    tags=%s," % tags_code)
-            result_lines.append(indent + "    extra_env=%s," % join_env)
-            result_lines.append(indent + ")")
-            result_lines.append(indent + "_add_step_metadata(context, %s)" % join_path_var)
+            result_lines.append(f"{pfx}_ji_{depth} = compress_list({results_var})")
+            result_lines.append(f'{pfx}{join_tid_var} = {fe_tid_var} + "-join"')
+            result_lines.append(f"{pfx}{join_path_var} = _run_step(")
+            result_lines.append(f"{pfx}    context, {join_name!r}, run_id, _ji_{depth},")
+            result_lines.append(f"{pfx}    {join_tid_var},")
+            result_lines.append(f"{pfx}    retry_count=context.retry_number,")
+            result_lines.append(f"{pfx}    max_user_code_retries={join_max_retries},")
+            result_lines.append(f"{pfx}    tags={tags_code},")
+            result_lines.append(f"{pfx}    extra_env={join_env},")
+            result_lines.append(f"{pfx})")
+            result_lines.append(f"{pfx}_add_step_metadata(context, {join_path_var})")
             return join_path_var
 
-        # Emit depth 0 of the inner chain.
-        # At depth 0: the foreach step is inner_chain[0][0], its input is _base_path,
-        # and its task_id prefix is _outer_fe_tid with split index _outer_split.
+        # Emit depth 0: foreach step is inner_chain[0][0], input is _base_path,
+        # task_id prefix is _outer_fe_tid with split index _outer_split.
         final_var = _emit(0, "", "_base_path", "_outer_fe_tid", "_outer_split")
-        result_lines.append("return %s" % final_var)
+        result_lines.append(f"return {final_var}")
         return result_lines
 
     # ── Job body ───────────────────────────────────────────────────────────────
@@ -1171,14 +1137,12 @@ class DagsterCompiler:
         body = self._generate_job_body()
         # Build manually — dedent(f"""...""") mishandles multi-line substitutions
         body_indented = "\n".join("    " + line for line in body.splitlines())
-        if self.workflow_timeout:
-            tags_arg = f'tags={{"dagster/max_runtime": "{self.workflow_timeout}"}}'
-            return f"@job({tags_arg})\ndef {self.job_name}():\n{body_indented}\n"
-        return f"@job\ndef {self.job_name}():\n{body_indented}\n"
+        job_args = f'(tags={{"dagster/max_runtime": "{self.workflow_timeout}"}})' if self.workflow_timeout else ""
+        return f"@job{job_args}\ndef {self.job_name}():\n{body_indented}\n"
 
     def _generate_job_body(self) -> str:
         """
-        Walk the graph BFS and emit assignment statements.
+        Walk topologically ordered nodes and emit assignment statements.
         var_map: step_name -> Python expression for its output.
 
         For nested foreach chains (depth > 1), steps inside the chain are handled
@@ -1187,53 +1151,13 @@ class DagsterCompiler:
         and its result (the inner join's task path) is used by .collect() for the
         outer join.
         """
-        lines: List[str] = []
-        var_map: Dict[str, str] = {}
+        lines: list[str] = []
+        var_map: dict[str, str] = {}
 
-        # Build foreach chain info to identify nested steps that are handled
-        # by compound ops and must be skipped in the top-level job body.
         chains = self._foreach_chains()
-
-        # nested_body_steps: step names that are the body of a foreach in a nested chain
-        # nested_inner_joins: the inner join steps that are inside compound ops
-        # For each nested chain (depth > 1):
-        #   - chain[0] = (outer_foreach, outer_body=inner_foreach, outer_join)
-        #   - chain[1..] = (inner_foreach, inner_body, inner_join), ...
-        # The compound op replaces outer_body (and everything inside the chain from chain[1:])
-        # In the job body:
-        #   - outer_foreach: still emitted normally (DynamicOut)
-        #   - outer_body..inner_join: all SKIPPED (inside compound op)
-        #   - outer_join: emitted with .collect() on the compound op's mapped output
-        #   - compound op result var is stored under outer_body name for the join lookup
-
-        # steps_in_compound: set of step names handled inside some compound op
-        steps_in_compound: set = set()
-        # compound_parent_for_join: outer_join -> outer_foreach name
-        # (so we know to use compound_op for the .collect())
-        compound_info: Dict[str, str] = {}  # outer_join_name -> outer_foreach_name
-
-        for outer_name, chain in chains.items():
-            if len(chain) > 1:
-                # The outer_body is chain[0][1], which is itself a foreach step.
-                # All steps from chain[1] onward (the inner chain) are inside the compound op.
-                outer_foreach_name, outer_body_name, outer_join_name = chain[0]
-                # Skip: outer_body and everything deeper
-                steps_in_compound.add(outer_body_name)
-                for d in range(1, len(chain)):
-                    _, body_n, join_n = chain[d]
-                    steps_in_compound.add(body_n)
-                    steps_in_compound.add(join_n)
-                # outer_join uses compound op result
-                compound_info[outer_join_name] = outer_foreach_name
+        steps_in_compound = self._steps_in_compound()
 
         def _emit(node) -> None:
-            if node.name in var_map:
-                return
-            # Ensure parents are emitted first
-            for p in node.in_funcs:
-                if p not in var_map and p not in steps_in_compound:
-                    _emit(self.graph[p])
-
             # Skip steps handled inside compound ops
             if node.name in steps_in_compound:
                 return
@@ -1244,126 +1168,84 @@ class DagsterCompiler:
             # ── start step ────────────────────────────────────────────────────
             if node.name == "start":
                 var = "r_start"
-                lines.append("%s = %s()" % (var, op_call))
+                lines.append(f"{var} = {op_call}()")
                 var_map["start"] = var
                 if ntype == "split":
                     for branch in node.out_funcs:
-                        var_map["_branch_%s" % branch] = "%s.%s" % (var, branch)
+                        var_map[f"_branch_{branch}"] = f"{var}.{branch}"
                 elif ntype == "foreach" and "start" in chains and len(chains["start"]) > 1:
-                    # Nested foreach: wire compound op via .map()
                     compound_name = self._compound_op_name("start")
                     compound_var = "r_start__body"
-                    lines.append("%s = %s.map(%s)" % (compound_var, var, compound_name))
+                    lines.append(f"{compound_var} = {var}.map({compound_name})")
                     outer_body_name = chains["start"][0][1]
                     var_map[outer_body_name] = compound_var
-                return
 
             # ── end step ──────────────────────────────────────────────────────
-            if ntype == "end":
+            elif ntype == "end":
                 pvar = self._resolve_input(node, var_map)
-                lines.append("%s(%s)" % (op_call, pvar))
+                lines.append(f"{op_call}({pvar})")
                 var_map[node.name] = "_end"
-                return
 
             # ── linear step ───────────────────────────────────────────────────
-            if ntype == "linear":
-                parent_is_foreach = any(
-                    self.graph[p].type == "foreach"
-                    or (p == "start" and self.graph["start"].type == "foreach")
-                    for p in node.in_funcs
+            elif ntype == "linear":
+                foreach_parent = next(
+                    (p for p in node.in_funcs if self.graph[p].type == "foreach"),
+                    None,
                 )
-                if parent_is_foreach:
-                    foreach_parent = next(
-                        p for p in node.in_funcs
-                        if self.graph[p].type == "foreach"
-                        or (p == "start" and self.graph["start"].type == "foreach")
-                    )
-                    # Check if this foreach_parent has a compound op (nested chain)
-                    outer_foreach_name = foreach_parent
-                    if outer_foreach_name in chains and len(chains[outer_foreach_name]) > 1:
-                        # This body step is the first outer body (itself a foreach) —
-                        # it should already be in steps_in_compound and thus skipped.
-                        # If we get here something is wrong; emit a comment and skip.
-                        var_map[node.name] = "None  # handled by compound op"
-                        return
+                var = f"r_{node.name}"
+                if foreach_parent is not None:
                     dyn_var = var_map[foreach_parent]
-                    var = "r_%s" % node.name
-                    lines.append("%s = %s.map(%s)" % (var, dyn_var, op_call))
-                    var_map[node.name] = var
+                    lines.append(f"{var} = {dyn_var}.map({op_call})")
                 else:
                     pvar = self._resolve_input(node, var_map)
-                    var = "r_%s" % node.name
-                    lines.append("%s = %s(%s)" % (var, op_call, pvar))
-                    var_map[node.name] = var
-                return
+                    lines.append(f"{var} = {op_call}({pvar})")
+                var_map[node.name] = var
 
             # ── split step ────────────────────────────────────────────────────
-            if ntype == "split":
+            elif ntype == "split":
                 pvar = self._resolve_input(node, var_map)
-                var = "r_%s" % node.name
-                lines.append("%s = %s(%s)" % (var, op_call, pvar))
+                var = f"r_{node.name}"
+                lines.append(f"{var} = {op_call}({pvar})")
                 var_map[node.name] = var
                 for branch in node.out_funcs:
-                    var_map["_branch_%s" % branch] = "%s.%s" % (var, branch)
-                return
+                    var_map[f"_branch_{branch}"] = f"{var}.{branch}"
 
             # ── foreach step ──────────────────────────────────────────────────
-            if ntype == "foreach":
+            elif ntype == "foreach":
                 pvar = self._resolve_input(node, var_map)
-                var = "r_%s" % node.name
-                lines.append("%s = %s(%s)" % (var, op_call, pvar))
+                var = f"r_{node.name}"
+                lines.append(f"{var} = {op_call}({pvar})")
                 var_map[node.name] = var
-                # If this foreach has a nested chain, wire the compound op via .map()
                 if node.name in chains and len(chains[node.name]) > 1:
                     compound_name = self._compound_op_name(node.name)
-                    compound_var = "r_%s__body" % node.name
-                    lines.append("%s = %s.map(%s)" % (compound_var, var, compound_name))
-                    # The outer_join will use compound_var.collect(); store under outer_body name
+                    compound_var = f"r_{node.name}__body"
+                    lines.append(f"{compound_var} = {var}.map({compound_name})")
                     outer_body_name = chains[node.name][0][1]
                     var_map[outer_body_name] = compound_var
-                return
 
             # ── join step ─────────────────────────────────────────────────────
-            if ntype == "join":
-                is_foreach_join = bool(
-                    node.split_parents
-                    and (
-                        self.graph[node.split_parents[-1]].type == "foreach"
-                        or (
-                            node.split_parents[-1] == "start"
-                            and self.graph["start"].type == "foreach"
-                        )
-                    )
-                )
-                if is_foreach_join:
+            elif ntype == "join":
+                var = f"r_{node.name}"
+                if self._is_foreach_join(node):
                     body_step = node.in_funcs[0]
                     if body_step in steps_in_compound:
-                        # This is the outer join of a nested foreach chain.
-                        # The compound op's mapped result is stored under the outer foreach's
-                        # body step name (chain[0][1]) which is also the inner foreach name.
-                        # node.split_parents[-1] is the outer foreach that feeds this join.
                         outer_foreach_name = node.split_parents[-1]
                         outer_body_name = chains[outer_foreach_name][0][1]
-                        dyn_var = var_map.get(outer_body_name, "r_%s__body" % outer_foreach_name)
+                        dyn_var = var_map[outer_body_name]
                     else:
-                        dyn_var = var_map.get(body_step, "r_%s" % body_step)
-                    var = "r_%s" % node.name
-                    lines.append("%s = %s(%s.collect())" % (var, op_call, dyn_var))
-                    var_map[node.name] = var
+                        dyn_var = var_map[body_step]
+                    lines.append(f"{var} = {op_call}({dyn_var}.collect())")
                 else:
                     in_vars = [var_map.get(p, p) for p in node.in_funcs]
-                    args = ", ".join(in_vars)
-                    var = "r_%s" % node.name
-                    lines.append("%s = %s(%s)" % (var, op_call, args))
-                    var_map[node.name] = var
-                return
+                    lines.append(f"{var} = {op_call}({', '.join(in_vars)})")
+                var_map[node.name] = var
 
         for node in self._topological_order():
             _emit(node)
 
         return "\n".join(lines) if lines else "pass"
 
-    def _resolve_input(self, node, var_map: Dict[str, str]) -> str:
+    def _resolve_input(self, node, var_map: dict[str, str]) -> str:
         """Get the Python expression for the first upstream input to this node."""
         parent = node.in_funcs[0] if node.in_funcs else None
         if parent is None:
@@ -1376,19 +1258,18 @@ class DagsterCompiler:
 
     # ── Schedule ───────────────────────────────────────────────────────────────
 
-    def _extract_schedule(self) -> Optional[str]:
+    _SCHEDULE_CRON = {"daily": "0 0 * * *", "hourly": "0 * * * *", "weekly": "0 0 * * 0"}
+
+    def _extract_schedule(self) -> str | None:
         sched = self.flow._flow_decorators.get("schedule")
         if not sched:
             return None
         sched = sched[0]
         if sched.attributes.get("cron"):
             return sched.attributes["cron"]
-        elif sched.attributes.get("daily"):
-            return "0 0 * * *"
-        elif sched.attributes.get("hourly"):
-            return "0 * * * *"
-        elif sched.attributes.get("weekly"):
-            return "0 0 * * 0"
+        for key, cron in self._SCHEDULE_CRON.items():
+            if sched.attributes.get(key):
+                return cron
         return None
 
     def _render_schedule(self) -> str:

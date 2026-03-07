@@ -6,14 +6,13 @@ import contextlib
 import json
 import os
 import sys
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar
 
 from metaflow.runner.deployer import DeployedFlow, TriggeredRun
 from metaflow.runner.utils import get_lower_level_group, handle_timeout, temporary_fifo
 
 if TYPE_CHECKING:
-    import metaflow
-    import metaflow.runner.deployer_impl
+    pass
 
 
 @contextlib.contextmanager
@@ -40,7 +39,7 @@ class DagsterTriggeredRun(TriggeredRun):
     """
 
     @property
-    def dagster_ui(self) -> Optional[str]:
+    def dagster_ui(self) -> str | None:
         """URL to the Dagster UI for this run, if available.
 
         Returns a link to the local Dagster UI (http://localhost:3000) by default.
@@ -48,7 +47,7 @@ class DagsterTriggeredRun(TriggeredRun):
         """
         parts = self.pathspec.split("/")
         if len(parts) == 2 and parts[1].startswith("dagster-"):
-            return "http://localhost:3000/runs/%s" % parts[1][len("dagster-"):]
+            return "http://localhost:3000/runs/{}".format(parts[1][len("dagster-"):])
         return None
 
     @property
@@ -78,7 +77,7 @@ class DagsterTriggeredRun(TriggeredRun):
             return None
 
     @property
-    def status(self) -> Optional[str]:
+    def status(self) -> str | None:
         """Return a simple status string based on the underlying Metaflow run."""
         run = self.run
         if run is None:
@@ -93,7 +92,7 @@ class DagsterTriggeredRun(TriggeredRun):
 class DagsterDeployedFlow(DeployedFlow):
     """A Metaflow flow compiled as a Dagster definitions file."""
 
-    TYPE: ClassVar[Optional[str]] = "dagster"
+    TYPE: ClassVar[str | None] = "dagster"
 
     @property
     def id(self) -> str:
@@ -107,7 +106,7 @@ class DagsterDeployedFlow(DeployedFlow):
         })
 
     @classmethod
-    def from_deployment(cls, identifier: str, metadata: Optional[str] = None) -> "DagsterDeployedFlow":
+    def from_deployment(cls, identifier: str, metadata: str | None = None) -> DagsterDeployedFlow:
         """Recover a DagsterDeployedFlow from a deployment identifier.
 
         The identifier is the JSON string returned by ``deployed_flow.id``.
@@ -118,12 +117,12 @@ class DagsterDeployedFlow(DeployedFlow):
             info = json.loads(identifier)
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError(
-                "Invalid Dagster deployment identifier (expected JSON): %r" % identifier
+                f"Invalid Dagster deployment identifier (expected JSON): {identifier!r}"
             ) from exc
         for required in ("flow_file", "name", "flow_name"):
             if required not in info:
                 raise ValueError(
-                    "Deployment identifier missing required field %r" % required
+                    f"Deployment identifier missing required field {required!r}"
                 )
         flow_file = info["flow_file"]
         deployer = DagsterDeployer(flow_file=flow_file, deployer_kwargs={})
@@ -148,7 +147,7 @@ class DagsterDeployedFlow(DeployedFlow):
         DagsterTriggeredRun
         """
         # Convert kwargs to "key=value" strings for --run-param.
-        run_params = tuple("%s=%s" % (k, v) for k, v in kwargs.items())
+        run_params = tuple(f"{k}={v}" for k, v in kwargs.items())
 
         # Retrieve definitions_file from additional_info stored during create.
         additional_info = getattr(self.deployer, "additional_info", {}) or {}
@@ -183,7 +182,7 @@ class DagsterDeployedFlow(DeployedFlow):
                 return DagsterTriggeredRun(deployer=self.deployer, content=content)
 
         raise RuntimeError(
-            "Error triggering Dagster job for flow %r" % self.deployer.flow_file
+            f"Error triggering Dagster job for flow {self.deployer.flow_file!r}"
         )
 
     # Keep trigger() as an alias for backwards compatibility.
