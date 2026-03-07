@@ -20,6 +20,7 @@ Generated file structure:
 
 import os
 import sys
+from collections import deque
 from textwrap import dedent, indent
 from typing import Dict, List, Optional
 
@@ -139,7 +140,7 @@ def _run_cmd(
     if stderr.strip():
         context.log.info(stderr)
     if proc.returncode != 0:
-        raise Exception(
+        raise RuntimeError(
             f"Command failed (exit {{proc.returncode}}):\\n{{stderr[-2000:]}}"
         )
 
@@ -169,6 +170,100 @@ def _run_init(
     return f"{{run_id}}/_parameters/{{params_task_id}}"
 
 
+def _get_ds_root() -> str:
+    """Return the local datastore root from embedded top-level args or env."""
+    return next(
+        (a.split("--datastore-root=", 1)[1] for a in METAFLOW_TOP_ARGS if a.startswith("--datastore-root=")),
+        os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", ""),
+    )
+
+
+# Code package cache — built once per process when @sandbox (or similar) is present.
+# The tarball is kept on disk until process exit so TarballStager can deliver it.
+_CODE_PACKAGE_CACHE: Dict[str, Optional[str]] = {{
+    "metadata": None, "sha": None, "url": None, "local_path": None,
+}}
+
+
+def _ensure_code_package():
+    """Build and upload the flow code package, caching the result process-wide."""
+    if _CODE_PACKAGE_CACHE["metadata"] is not None:
+        return (
+            _CODE_PACKAGE_CACHE["metadata"],
+            _CODE_PACKAGE_CACHE["sha"],
+            _CODE_PACKAGE_CACHE["url"],
+            _CODE_PACKAGE_CACHE["local_path"],
+        )
+
+    import re
+    import tempfile
+    from metaflow.datastore import FlowDataStore
+    from metaflow.plugins import DATASTORES
+
+    with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+        package_path = tmp.name
+    try:
+        package_cmd = (
+            [sys.executable, FLOW_FILE]
+            + [a for a in METAFLOW_TOP_ARGS if a != "--quiet"]
+            + ["package", "save", package_path]
+        )
+        _pkg_proc = subprocess.Popen(
+            package_cmd,
+            env=_build_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=os.path.dirname(FLOW_FILE) or ".",
+        )
+        _pkg_stdout, _pkg_stderr = _communicate(_pkg_proc)
+        if _pkg_proc.returncode != 0:
+            raise RuntimeError(
+                "Failed to build Metaflow code package:\\n"
+                + (_pkg_stderr or _pkg_stdout)[-2000:]
+            )
+        meta_src = (_pkg_stdout or "") + "\\n" + (_pkg_stderr or "")
+        m = re.search(r"metadata:\\s*(\\{{.*\\}})", meta_src)
+        package_metadata = (
+            m.group(1).strip()
+            if m
+            else '{{"version": 0, "archive_format": "tgz", "mfcontent_version": 1}}'
+        )
+
+        with open(package_path, "rb") as f:
+            blob = f.read()
+
+        datastore_type = next(
+            (a.split("--datastore=", 1)[1] for a in METAFLOW_TOP_ARGS if a.startswith("--datastore=")),
+            None,
+        )
+        storage_impl = next(ds for ds in DATASTORES if ds.TYPE == datastore_type)
+        flow_datastore = FlowDataStore(
+            FLOW_NAME,
+            storage_impl=storage_impl,
+            ds_root=_get_ds_root() or None,
+        )
+        package_url, package_sha = flow_datastore.save_data([blob], len_hint=1)[0]
+        _CODE_PACKAGE_CACHE["metadata"] = package_metadata
+        _CODE_PACKAGE_CACHE["sha"] = package_sha
+        _CODE_PACKAGE_CACHE["url"] = package_url
+        _CODE_PACKAGE_CACHE["local_path"] = package_path
+        atexit.register(lambda p=package_path: os.path.exists(p) and os.unlink(p))
+    except Exception:
+        try:
+            os.unlink(package_path)
+        except Exception:
+            pass
+        raise
+
+    return (
+        _CODE_PACKAGE_CACHE["metadata"],
+        _CODE_PACKAGE_CACHE["sha"],
+        _CODE_PACKAGE_CACHE["url"],
+        _CODE_PACKAGE_CACHE["local_path"],
+    )
+
+
 def _run_step(
     context: OpExecutionContext,
     step_name: str,
@@ -182,105 +277,6 @@ def _run_step(
     extra_env: Optional[Dict[str, str]] = None,
 ) -> str:
     """Execute one Metaflow step. Returns its full task pathspec."""
-    code_package_cache = _run_step.__dict__.setdefault(
-        "_code_package_cache", {{"metadata": None, "sha": None, "url": None, "local_path": None}}
-    )
-
-    def _ensure_code_package():
-        if (
-            code_package_cache["metadata"] is not None
-            and code_package_cache["sha"] is not None
-            and code_package_cache["url"] is not None
-        ):
-            return (
-                code_package_cache["metadata"],
-                code_package_cache["sha"],
-                code_package_cache["url"],
-                code_package_cache["local_path"],
-            )
-
-        import re
-        import tempfile
-        from metaflow.datastore import FlowDataStore
-        from metaflow.plugins import DATASTORES
-
-        with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
-            package_path = tmp.name
-        try:
-            package_cmd = (
-                [sys.executable, FLOW_FILE]
-                + [a for a in METAFLOW_TOP_ARGS if a != "--quiet"]
-                + ["package", "save", package_path]
-            )
-            _pkg_proc = subprocess.Popen(
-                package_cmd,
-                env=_build_env(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=os.path.dirname(FLOW_FILE) or ".",
-            )
-            _pkg_stdout, _pkg_stderr = _communicate(_pkg_proc)
-            if _pkg_proc.returncode != 0:
-                raise RuntimeError(
-                    "Failed to build Metaflow code package:\\n"
-                    + (_pkg_stderr or _pkg_stdout)[-2000:]
-                )
-            meta_src = (_pkg_stdout or "") + "\\n" + (_pkg_stderr or "")
-            m = re.search(r"metadata:\\s*(\\{{.*\\}})", meta_src)
-            package_metadata = (
-                m.group(1).strip()
-                if m
-                else '{{"version": 0, "archive_format": "tgz", "mfcontent_version": 1}}'
-            )
-
-            with open(package_path, "rb") as f:
-                blob = f.read()
-
-            datastore_type = next(
-                (
-                    a.split("--datastore=", 1)[1]
-                    for a in METAFLOW_TOP_ARGS
-                    if a.startswith("--datastore=")
-                ),
-                None,
-            )
-            datastore_root = next(
-                (
-                    a.split("--datastore-root=", 1)[1]
-                    for a in METAFLOW_TOP_ARGS
-                    if a.startswith("--datastore-root=")
-                ),
-                None,
-            )
-            storage_impl = next(ds for ds in DATASTORES if ds.TYPE == datastore_type)
-            flow_datastore = FlowDataStore(
-                FLOW_NAME,
-                storage_impl=storage_impl,
-                ds_root=datastore_root,
-            )
-            package_url, package_sha = flow_datastore.save_data([blob], len_hint=1)[0]
-            code_package_cache["metadata"] = package_metadata
-            code_package_cache["sha"] = package_sha
-            code_package_cache["url"] = package_url
-            # Keep the local tarball alive so TarballStager (used by @sandbox)
-            # can deliver the code package via backend.upload() without S3.
-            code_package_cache["local_path"] = package_path
-            atexit.register(lambda p=package_path: os.path.exists(p) and os.unlink(p))
-        except Exception:
-            try:
-                os.unlink(package_path)
-            except Exception:
-                pass
-            raise
-
-        return (
-            code_package_cache["metadata"],
-            code_package_cache["sha"],
-            code_package_cache["url"],
-            code_package_cache["local_path"],
-        )
-
     class _CLIArgs:
         def __init__(self):
             self.entrypoint = [sys.executable, FLOW_FILE]
@@ -381,10 +377,7 @@ def _get_foreach_splits(run_id: str, step_name: str, task_id: str) -> int:
     """
     import gzip
     import pickle
-    ds_root = next(
-        (a.split("--datastore-root=")[1] for a in METAFLOW_TOP_ARGS if a.startswith("--datastore-root=")),
-        os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", ""),
-    )
+    ds_root = _get_ds_root()
     try:
         data_json_path = os.path.join(ds_root, FLOW_NAME, run_id, step_name, task_id, "0.data.json")
         with open(data_json_path) as fh:
@@ -415,13 +408,8 @@ def _add_step_metadata(
     if len(parts) < 3:
         return
     run_id, step_name, task_id = parts[0], parts[1], parts[2]
-    ds_root = next(
-        (a.split("--datastore-root=")[1] for a in METAFLOW_TOP_ARGS
-         if a.startswith("--datastore-root=")),
-        os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL", ""),
-    )
     data_json_path = os.path.join(
-        ds_root, FLOW_NAME, run_id, step_name, task_id, "0.data.json"
+        _get_ds_root(), FLOW_NAME, run_id, step_name, task_id, "0.data.json"
     )
     try:
         with open(data_json_path) as fh:
@@ -496,6 +484,9 @@ class DagsterCompiler:
         self.flow_name = flow.name
         self.parameters = self._extract_parameters()
         self.schedule = self._extract_schedule()
+
+        self._topo_cache: Optional[List] = None
+        self._foreach_chains_cache: Optional[Dict[str, List]] = None
 
     # ── Public ─────────────────────────────────────────────────────────────────
 
@@ -620,8 +611,7 @@ class DagsterCompiler:
     # ── Op rendering ───────────────────────────────────────────────────────────
 
     def _topological_order(self):
-        if not hasattr(self, "_topo_cache"):
-            from collections import deque
+        if self._topo_cache is None:
             visited = set()
             queue = deque([self.graph["start"]])
             result = []
@@ -646,7 +636,7 @@ class DagsterCompiler:
         ntype = node.type
         if ntype == "end":
             return self._render_end_op(node)
-        elif ntype in ("linear",):
+        elif ntype == "linear":
             return self._render_linear_op(node)
         elif ntype == "join":
             return self._render_join_op(node)
@@ -955,7 +945,7 @@ class DagsterCompiler:
     # ── Foreach chain analysis ─────────────────────────────────────────────────
 
     def _foreach_chains(self) -> Dict[str, List]:
-        if not hasattr(self, "_foreach_chains_cache"):
+        if self._foreach_chains_cache is None:
             self._foreach_chains_cache = self._compute_foreach_chains()
         return self._foreach_chains_cache
 

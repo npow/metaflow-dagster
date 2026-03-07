@@ -137,11 +137,7 @@ def _validate_workflow(flow, graph):
                 )
     # Validate no unsupported flow-level decorators
     for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):
-        try:
-            decos = flow._flow_decorators.get(bad_deco)
-        except Exception:
-            decos = None
-        if decos:
+        if flow._flow_decorators.get(bad_deco):
             raise DagsterException(
                 "@%s is not supported with Dagster deployments." % bad_deco
             )

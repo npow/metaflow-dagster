@@ -46,12 +46,9 @@ class DagsterTriggeredRun(TriggeredRun):
         Returns a link to the local Dagster UI (http://localhost:3000) by default.
         The run ID embedded in the Metaflow pathspec is the Dagster run UUID.
         """
-        try:
-            _, run_id = self.pathspec.split("/")
-            if run_id.startswith("dagster-"):
-                return "http://localhost:3000/runs/%s" % run_id[len("dagster-"):]
-        except Exception:
-            pass
+        parts = self.pathspec.split("/")
+        if len(parts) == 2 and parts[1].startswith("dagster-"):
+            return "http://localhost:3000/runs/%s" % parts[1][len("dagster-"):]
         return None
 
     @property
