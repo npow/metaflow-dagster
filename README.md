@@ -197,6 +197,68 @@ python my_flow.py dagster create my_flow_dagster.py --tag env:prod --tag version
 python my_flow.py dagster create my_flow_dagster.py --name nightly_pipeline
 ```
 
+### Resource hints
+
+`@resources` on a step forwards CPU, memory, and GPU hints to the underlying compute backend
+(e.g. `@kubernetes`, `@batch`, `@sandbox`) via `--with=resources:cpu=N,memory=M,gpu=G`:
+
+```python
+class MyFlow(FlowSpec):
+    @resources(cpu=4, memory=8000, gpu=1)
+    @step
+    def train(self):
+        ...
+```
+
+The resource hints are also visible as Dagster op tags in the UI.
+
+### Event-driven sensors (`@trigger` / `@trigger_on_finish`)
+
+Decorate your flow with `@trigger` or `@trigger_on_finish` to emit a `SensorDefinition` in the
+generated file automatically.
+
+```python
+# Fire this flow when a named event is detected
+@trigger(event="data.ready")
+class MyFlow(FlowSpec):
+    ...
+```
+
+```python
+# Fire this flow when UpstreamFlow completes successfully in Dagster
+@trigger_on_finish(flow="UpstreamFlow")
+class DownstreamFlow(FlowSpec):
+    ...
+```
+
+The `@trigger_on_finish` sensor polls the Dagster run history and yields a `RunRequest` for each
+new successful run of the upstream job. The `@trigger(event=...)` sensor emits a stub with a
+`TODO` comment — wire it to your event source (webhook, message queue, etc.).
+
+Both sensors are auto-included in the `Definitions` object:
+
+```python
+defs = Definitions(jobs=[MyFlow], schedules=[...], sensors=[MyFlow_on_finish_0])
+```
+
+### Resume a failed run
+
+Re-run a failed Dagster job, skipping steps that already completed:
+
+```bash
+python my_flow.py dagster resume --run-id <dagster-run-id>
+```
+
+Pass `--definitions-file` if you want to write the resume definitions to a file first:
+
+```bash
+python my_flow.py dagster resume --run-id <dagster-run-id> \
+    --definitions-file my_flow_resume.py
+```
+
+The resumed run reuses the original Metaflow run ID via `--clone-run-id`, so all completed step
+outputs are available under the same pathspec.
+
 ## Configuration
 
 ### Metadata service and datastore
@@ -235,6 +297,8 @@ Each Metaflow step becomes a `@op`. The generated file:
 - runs each step as a subprocess via the standard `metaflow step` CLI
 - passes `--input-paths` correctly for joins and foreach splits
 - emits Metaflow artifact keys and a retrieval snippet to the Dagster UI after each step
+- forwards `@resources` hints to the compute backend via `--with=resources:...`
+- emits `SensorDefinition`s for `@trigger` and `@trigger_on_finish` decorators
 
 ### Job graph
 
