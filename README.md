@@ -1,9 +1,10 @@
 # metaflow-dagster
 
 [![CI](https://github.com/npow/metaflow-dagster/actions/workflows/ci.yml/badge.svg)](https://github.com/npow/metaflow-dagster/actions/workflows/ci.yml)
+[![E2E](https://github.com/npow/metaflow-dagster/actions/workflows/e2e.yml/badge.svg)](https://github.com/npow/metaflow-dagster/actions/workflows/e2e.yml)
 [![PyPI](https://img.shields.io/pypi/v/metaflow-dagster)](https://pypi.org/project/metaflow-dagster/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
 Deploy and run Metaflow flows as Dagster jobs.
 
@@ -85,12 +86,18 @@ class on the start op:
 python param_flow.py dagster create param_flow_dagster.py
 ```
 
-Then pass them via Dagster's run config:
+Then pass them via Dagster's run config when launching from the UI, or via a config file when
+using the CLI:
 
-```python
-result = ParametrizedFlow.execute_in_process(run_config={
-    "ops": {"op_start": {"config": {"greeting": "Hi", "count": 5}}}
-})
+```bash
+# config.yaml
+ops:
+  op_start:
+    config:
+      greeting: Hi
+      count: 5
+
+python -m dagster job execute -f param_flow_dagster.py -j ParametrizedFlow -c config.yaml
 ```
 
 ### Step decorators (`--with`)
@@ -261,11 +268,17 @@ Dagster's log panel:
 git clone https://github.com/npow/metaflow-dagster.git
 cd metaflow-dagster
 pip install -e ".[test]"
-pytest -v
+
+# Fast compilation tests only (seconds)
+pytest -v -m "not e2e"
+
+# Full end-to-end suite (compiles + runs via `dagster job execute`)
+pytest -v -m e2e
 ```
 
-The test suite runs real end-to-end: compile → load module → `execute_in_process` → verify
-Metaflow artifacts on disk. No mocks.
+The e2e tests compile each flow to a real Dagster definitions file, execute it via
+`dagster job execute` against a temporary SQLite-backed Dagster instance, and verify
+Metaflow artifacts on disk. No mocks, no webserver required.
 
 ## License
 
