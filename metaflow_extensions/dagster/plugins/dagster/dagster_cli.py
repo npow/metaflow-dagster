@@ -7,7 +7,6 @@ import sys
 import tempfile
 import time
 import uuid
-import warnings
 
 from metaflow._vendor import click
 from metaflow.exception import MetaflowException
@@ -120,20 +119,33 @@ def _validate_workflow(flow, graph):
                 raise DagsterException(
                     f"Step *{node.name}* uses @slurm which is not supported with Dagster."
                 )
-            if deco.name == "resources":
-                warnings.warn(
-                    f"Step *{node.name}* uses @resources. Resource requirements are not enforced "
-                    "by this integration — configure resources on your Dagster op/job "
-                    "resource definitions directly.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+            # @resources hints are forwarded to compute backends via STEP_WITH_DECORATORS
+    # @trigger and @trigger_on_finish are extracted and wired as Dagster sensors at compile time
     # Validate no unsupported flow-level decorators
-    for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):
+    for bad_deco in ("exit_hook",):
         if flow._flow_decorators.get(bad_deco):
             raise DagsterException(
                 f"@{bad_deco} is not supported with Dagster deployments."
             )
+
+
+def _gather_step_env():
+    """Gather Metaflow runtime config keys to embed in the generated file."""
+    return {
+        k: v
+        for k, v in config_values()
+        if v is not None
+        and k.startswith(
+            (
+                "METAFLOW_DEFAULT_",
+                "METAFLOW_DATASTORE_",
+                "METAFLOW_DATATOOLS_",
+                "METAFLOW_SERVICE_",
+                "METAFLOW_METADATA",
+                "METAFLOW_DEBUG_",
+            )
+        )
+    }
 
 
 @click.group()
@@ -210,23 +222,6 @@ def create(obj, file, name=None, tags=None, user_namespace=None,
 
     flow_file = os.path.abspath(sys.argv[0])
 
-    # Gather metaflow runtime configuration to embed in the generated file
-    step_env = {
-        k: v
-        for k, v in config_values()
-        if v is not None
-        and k.startswith(
-            (
-                "METAFLOW_DEFAULT_",
-                "METAFLOW_DATASTORE_",
-                "METAFLOW_DATATOOLS_",
-                "METAFLOW_SERVICE_",
-                "METAFLOW_METADATA",
-                "METAFLOW_DEBUG_",
-            )
-        )
-    }
-
     compiler = DagsterCompiler(
         job_name=job_name,
         graph=obj.graph,
@@ -241,7 +236,7 @@ def create(obj, file, name=None, tags=None, user_namespace=None,
         with_decorators=list(with_decorators) if with_decorators else [],
         namespace=user_namespace,
         workflow_timeout=workflow_timeout,
-        step_env=step_env,
+        step_env=_gather_step_env(),
     )
 
     with open(file, "w") as f:
@@ -366,5 +361,165 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
 
     obj.echo(
         f"Dagster job *{resolved_job_name}* executed from *{definitions_file}*.",
+        bold=True,
+    )
+
+
+@dagster.command(help="Resume a failed Dagster job run, reusing outputs from completed steps.")
+@click.option(
+    "--run-id",
+    required=True,
+    help="Metaflow run ID of the failed run to resume (e.g. dagster-abc123).",
+)
+@click.option(
+    "--definitions-file",
+    default=None,
+    help="Path to the generated Dagster definitions file. Defaults to <FlowName>_dagster.py.",
+)
+@click.option(
+    "--job-name",
+    default=None,
+    type=str,
+    help="Dagster job name. Defaults to the flow name.",
+)
+@click.option(
+    "--tag",
+    "tags",
+    multiple=True,
+    default=None,
+    help="Tag for the new Metaflow run (repeatable).",
+)
+@click.option(
+    "--with",
+    "with_decorators",
+    multiple=True,
+    default=None,
+    help="Inject a Metaflow step decorator at deploy time (repeatable).",
+)
+@click.option(
+    "--workflow-timeout",
+    default=None,
+    type=int,
+    help="Maximum wall-clock seconds for the entire job run.",
+)
+@click.option(
+    "--namespace",
+    "user_namespace",
+    default=None,
+    help="Metaflow namespace for the resumed run.",
+)
+@click.option(
+    "--deployer-attribute-file",
+    default=None,
+    hidden=True,
+    help="Write resumed-run info JSON here (used by Metaflow Deployer API).",
+)
+@click.pass_obj
+def resume(
+    obj,
+    run_id,
+    definitions_file=None,
+    job_name=None,
+    tags=None,
+    with_decorators=None,
+    workflow_timeout=None,
+    user_namespace=None,
+    deployer_attribute_file=None,
+):
+    """Re-execute a failed Dagster job, skipping steps whose task output already exists.
+
+    A new definitions file is compiled with ORIGIN_RUN_ID set to *run_id*.  When
+    _run_step executes each Metaflow step it passes --clone-run-id to the Metaflow
+    CLI so the runtime can reuse completed task outputs and skip re-running them.
+    """
+    if definitions_file is None:
+        definitions_file = f"{obj.flow.name.lower()}_dagster.py"
+
+    resolved_job_name = _resolve_job_name(job_name, obj.flow.name, obj.flow)
+
+    _validate_workflow(obj.flow, obj.graph)
+
+    flow_file = os.path.abspath(sys.argv[0])
+
+    # Write a temporary definitions file with ORIGIN_RUN_ID embedded
+    with tempfile.NamedTemporaryFile(
+        suffix="_resume_dagster.py", delete=False, mode="w", dir=os.path.dirname(flow_file)
+    ) as tmp:
+        resume_defs_file = tmp.name
+
+    try:
+        compiler = DagsterCompiler(
+            job_name=resolved_job_name,
+            graph=obj.graph,
+            flow=obj.flow,
+            flow_file=flow_file,
+            metadata=obj.metadata,
+            environment=obj.environment,
+            flow_datastore=obj.flow_datastore,
+            event_logger=obj.event_logger,
+            monitor=obj.monitor,
+            tags=list(tags) if tags else [],
+            with_decorators=list(with_decorators) if with_decorators else [],
+            namespace=user_namespace,
+            workflow_timeout=workflow_timeout,
+            step_env=_gather_step_env(),
+            origin_run_id=run_id,
+        )
+
+        with open(resume_defs_file, "w") as f:
+            f.write(compiler.compile())
+
+        obj.echo(
+            f"Resuming *{obj.flow.name}* from run *{run_id}* as job *{resolved_job_name}*...",
+            bold=True,
+        )
+
+        cmd = [
+            sys.executable, "-m", "dagster", "job", "execute",
+            "-f", resume_defs_file,
+            "-j", resolved_job_name,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.stdout:
+            sys.stderr.write(result.stdout)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+
+        if result.returncode != 0:
+            raise DagsterException(
+                f"dagster job execute returned exit code {result.returncode}."
+            )
+    finally:
+        try:
+            os.unlink(resume_defs_file)
+        except Exception:
+            pass
+
+    # Derive the new Metaflow run-id from the Dagster UUID in the output
+    combined_output = (result.stdout or "") + (result.stderr or "")
+    match = re.search(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", combined_output)
+    if match:
+        new_run_id = "dagster-" + hashlib.sha1(match.group(1).encode()).hexdigest()[:12]
+    else:
+        new_run_id = f"dagster-{uuid.uuid4()}"
+
+    _fix_local_step_metadata(obj.flow.name, new_run_id)
+
+    if deployer_attribute_file:
+        pathspec = f"{obj.flow.name}/{new_run_id}"
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "pathspec": pathspec,
+                    "job_name": resolved_job_name,
+                    "origin_run_id": run_id,
+                    "metadata": {"flow_name": obj.flow.name},
+                },
+                f,
+            )
+
+    obj.echo(
+        f"Resumed Dagster job *{resolved_job_name}* (origin run: *{run_id}*, new run: *{new_run_id}*).",
         bold=True,
     )

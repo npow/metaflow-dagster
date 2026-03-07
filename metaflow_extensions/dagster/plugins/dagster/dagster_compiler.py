@@ -15,7 +15,8 @@ Generated file structure:
   5. Ops         (one @op per flow step)
   6. Job         (@job composing ops)
   7. Schedule    (optional)
-  8. Definitions
+  8. Sensors     (from @trigger / @trigger_on_finish, optional)
+  9. Definitions
 """
 
 import os
@@ -50,6 +51,7 @@ from typing import Dict, List, Optional
 
 from dagster import (
     Config,
+    DefaultSensorStatus,
     Definitions,
     DynamicOut,
     DynamicOutput,
@@ -59,9 +61,13 @@ from dagster import (
     Out,
     Output,
     RetryPolicy,
+    RunRequest,
     ScheduleDefinition,
+    SensorDefinition,
+    SensorEvaluationContext,
     job,
     op,
+    sensor,
 )
 from metaflow.decorators import extract_step_decorator_from_decospec
 from metaflow.util import compress_list
@@ -69,6 +75,10 @@ from metaflow.util import compress_list
 # ── Flow constants ─────────────────────────────────────────────────────────────
 FLOW_FILE = {flow_file!r}
 FLOW_NAME = {flow_name!r}
+
+# When set, _run_step passes --clone-run-id to Metaflow so completed tasks are
+# reused and only failed/pending steps are re-executed (resume support).
+ORIGIN_RUN_ID: Optional[str] = {origin_run_id!r}
 
 # Metaflow CLI top-level flags embedded at compile time
 METAFLOW_TOP_ARGS: List[str] = {top_args!r}
@@ -157,6 +167,8 @@ def _run_init(
         + METAFLOW_TOP_ARGS
         + ["init", "--run-id", run_id, "--task-id", params_task_id]
     )
+    if ORIGIN_RUN_ID:
+        cmd += ["--clone-run-id", ORIGIN_RUN_ID]
     extra = {{
         "METAFLOW_INIT_" + k.upper().replace("-", "_"): str(v)
         for k, v in (parameters or {{}}).items()
@@ -296,6 +308,8 @@ def _run_step(
                     None,
                 ),
             }}
+            if ORIGIN_RUN_ID:
+                self.command_options["clone-run-id"] = ORIGIN_RUN_ID
             if split_index is not None:
                 self.command_options["split-index"] = split_index
             self.env: Dict[str, str] = {{}}
@@ -482,6 +496,7 @@ class DagsterCompiler:
         namespace: str | None,
         workflow_timeout: int | None,
         step_env: dict[str, str],
+        origin_run_id: str | None = None,
     ):
         self.job_name = job_name
         self.graph = graph
@@ -497,10 +512,13 @@ class DagsterCompiler:
         self.namespace = namespace
         self.workflow_timeout = workflow_timeout
         self.step_env = step_env
+        self.origin_run_id = origin_run_id
 
         self.flow_name = flow.name
         self.parameters = self._extract_parameters()
         self.schedule = self._extract_schedule()
+        self.triggers = self._extract_triggers()
+        self.trigger_on_finishes = self._extract_trigger_on_finishes()
 
         self._topo_cache: list | None = None
         self._foreach_chains_cache: dict[str, list] | None = None
@@ -524,6 +542,8 @@ class DagsterCompiler:
         parts.append(self._render_job())
         if self.schedule:
             parts.append(self._render_schedule())
+        for sensor_code in self._render_sensors():
+            parts.append(sensor_code)
         parts.append(self._render_definitions())
         return "\n\n".join(p for p in parts if p.strip()) + "\n"
 
@@ -541,6 +561,7 @@ class DagsterCompiler:
             step_env=self.step_env,
             step_decorator_specs=step_decorator_specs,
             step_with_decorators=step_with_decorators,
+            origin_run_id=self.origin_run_id,
         )
 
     def _build_top_args(self) -> list[str]:
@@ -563,15 +584,43 @@ class DagsterCompiler:
         return args
 
     def _build_step_decorator_info(self) -> "tuple[dict[str, list[str]], dict[str, list[str]]]":
-        """Return (decorator_specs, with_decorators) dicts in a single pass over the graph."""
+        """Return (decorator_specs, with_decorators) dicts in a single pass over the graph.
+
+        For steps that carry @resources, the resource hints are forwarded to the
+        Metaflow compute backend via an extra resources:cpu=N,memory=M,gpu=G entry
+        in STEP_WITH_DECORATORS so backends like @kubernetes pick them up.
+        """
         specs: dict[str, list[str]] = {}
         withs: dict[str, list[str]] = {}
         for node in self._topological_order():
             step_specs = [d.make_decorator_spec() for d in node.decorators]
             step_specs.extend(self.with_decorators)
             specs[node.name] = step_specs
-            withs[node.name] = list(self.with_decorators)
+            step_withs = list(self.with_decorators)
+            # Forward @resources hints so compute backends receive them
+            resources_spec = self._build_resources_spec(node)
+            if resources_spec:
+                step_withs.append(resources_spec)
+            withs[node.name] = step_withs
         return specs, withs
+
+    def _build_resources_spec(self, node) -> str | None:
+        """Return a 'resources:cpu=N,memory=M,gpu=G' spec string from @resources, or None."""
+        for deco in node.decorators:
+            if deco.name == "resources":
+                parts = []
+                cpu = deco.attributes.get("cpu")
+                memory = deco.attributes.get("memory")
+                gpu = deco.attributes.get("gpu")
+                if cpu is not None:
+                    parts.append(f"cpu={cpu}")
+                if memory is not None:
+                    parts.append(f"memory={memory}")
+                if gpu is not None:
+                    parts.append(f"gpu={gpu}")
+                if parts:
+                    return "resources:" + ",".join(parts)
+        return None
 
     # ── Config class ───────────────────────────────────────────────────────────
 
@@ -1405,14 +1454,153 @@ class DagsterCompiler:
             )
         """)
 
+    # ── Trigger / trigger_on_finish extraction ─────────────────────────────────
+
+    def _extract_triggers(self) -> list[dict]:
+        """Return a list of {event_name, parameter_map} dicts from @trigger."""
+        import warnings
+        decos = self.flow._flow_decorators.get("trigger")
+        if not decos:
+            return []
+        raw_triggers = getattr(decos[0], "triggers", None) or []
+        result = []
+        for t in raw_triggers:
+            if not isinstance(t, dict):
+                continue
+            name = t.get("name")
+            if not name or not isinstance(name, str):
+                warnings.warn(
+                    f"@trigger entry has a non-string or deploy-time event name {name!r} — "
+                    "skipping this trigger. Evaluate the event name before deploying.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+            raw_params = t.get("parameters") or {}
+            param_map = dict(raw_params) if isinstance(raw_params, dict) else {}
+            result.append({"event_name": name, "parameter_map": param_map})
+        return result
+
+    def _extract_trigger_on_finishes(self) -> list[dict]:
+        """Return a list of {flow_name} dicts from @trigger_on_finish."""
+        import warnings
+        decos = self.flow._flow_decorators.get("trigger_on_finish")
+        if not decos:
+            return []
+        raw_triggers = getattr(decos[0], "triggers", None) or []
+        result = []
+        for t in raw_triggers:
+            if not isinstance(t, dict):
+                continue
+            flow_name = t.get("flow") or t.get("fq_name")
+            if not flow_name or not isinstance(flow_name, str):
+                warnings.warn(
+                    f"@trigger_on_finish entry has a non-string or missing flow name {flow_name!r} — "
+                    "skipping this trigger.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+            result.append({"flow_name": flow_name})
+        return result
+
+    # ── Sensor rendering ───────────────────────────────────────────────────────
+
+    def _render_sensors(self) -> list[str]:
+        """Emit sensor definitions for @trigger and @trigger_on_finish decorators."""
+        sensors = []
+        for i, t in enumerate(self.triggers):
+            sensors.append(self._render_event_sensor(t, i))
+        for i, t in enumerate(self.trigger_on_finishes):
+            sensors.append(self._render_finish_sensor(t, i))
+        return sensors
+
+    def _render_event_sensor(self, trigger: dict, idx: int) -> str:
+        event_name = trigger["event_name"]
+        param_map = trigger["parameter_map"]
+        sensor_name = f"{self.job_name}_on_event_{idx}"
+        # Build run_config snippet when there are parameter mappings
+        if param_map:
+            run_config_lines = (
+                "        run_config = {\n"
+                '            "ops": {"start": {"config": {\n'
+            )
+            for flow_param, event_field in param_map.items():
+                run_config_lines += (
+                    f'                {flow_param!r}: context.cursor or "",  '
+                    f"# mapped from event field {event_field!r}\n"
+                )
+            run_config_lines += "            }}}\n        }\n"
+        else:
+            run_config_lines = "        run_config = {}\n"
+
+        return dedent(f"""\
+            @sensor(job={self.job_name}, name={sensor_name!r}, default_status=DefaultSensorStatus.RUNNING)
+            def {sensor_name}(context: SensorEvaluationContext):
+                \"\"\"Fire {self.job_name} when the '{event_name}' event is detected.
+
+                Dagster does not have a native event-bus — this sensor polls for the event
+                by checking a cursor value.  Emit a RunRequest whenever you detect the event
+                (e.g., by reading a queue, a file marker, or an external API).
+                \"\"\"
+                # TODO: replace this stub with real event-detection logic.
+                # Example: read from a queue, a DB table, or an HTTP endpoint.
+                event_detected = False  # set to True when the event arrives
+                if event_detected:
+            {run_config_lines}        yield RunRequest(run_key=context.cursor, run_config=run_config)
+        """)
+
+    def _render_finish_sensor(self, trigger: dict, idx: int) -> str:
+        upstream_flow = trigger["flow_name"]
+        upstream_job = upstream_flow  # Dagster job name defaults to the flow name
+        sensor_name = f"{self.job_name}_on_finish_{idx}"
+        return dedent(f"""\
+            @sensor(job={self.job_name}, name={sensor_name!r}, default_status=DefaultSensorStatus.RUNNING)
+            def {sensor_name}(context: SensorEvaluationContext):
+                \"\"\"Fire {self.job_name} when Dagster job '{upstream_job}' completes successfully.
+
+                This sensor watches the Dagster run history for successful runs of the
+                upstream job (compiled from the '{upstream_flow}' Metaflow flow) and
+                triggers a new run of {self.job_name} for each new completion.
+                \"\"\"
+                from dagster import DagsterInstance, RunsFilter, DagsterRunStatus
+                instance = context.instance
+                last_cursor = context.cursor or "0"
+                runs = instance.get_runs(
+                    filters=RunsFilter(
+                        job_name={upstream_job!r},
+                        statuses=[DagsterRunStatus.SUCCESS],
+                    ),
+                    limit=50,
+                )
+                new_cursor = last_cursor
+                for run in runs:
+                    run_key = run.run_id
+                    if run_key > last_cursor:
+                        yield RunRequest(run_key=run_key)
+                        if run_key > new_cursor:
+                            new_cursor = run_key
+                context.update_cursor(new_cursor)
+        """)
+
     # ── Definitions ────────────────────────────────────────────────────────────
 
     def _render_definitions(self) -> str:
         sched_list = f"[{self.job_name}_schedule]" if self.schedule else "[]"
+        sensor_names = []
+        for i in range(len(self.triggers)):
+            sensor_names.append(f"{self.job_name}_on_event_{i}")
+        for i in range(len(self.trigger_on_finishes)):
+            sensor_names.append(f"{self.job_name}_on_finish_{i}")
+        if sensor_names:
+            sensors_list = "[" + ", ".join(sensor_names) + "]"
+        else:
+            sensors_list = "[]"
         return dedent(f"""\
             defs = Definitions(
                 jobs=[{self.job_name}],
                 schedules={sched_list},
+                sensors={sensors_list},
             )
         """)
 

@@ -359,10 +359,9 @@ class TestValidation:
         with pytest.raises(DagsterException, match="parallel"):
             _validate_workflow(MockFlow(), MockGraph())
 
-    def test_trigger_flow_deco_raises(self):
-        """@trigger is unsupported at the flow level."""
+    def test_trigger_flow_deco_no_longer_raises(self):
+        """@trigger is now supported — it produces Dagster sensors instead of raising."""
         from metaflow_extensions.dagster.plugins.dagster.dagster_cli import (
-            DagsterException,
             _validate_workflow,
         )
 
@@ -375,8 +374,8 @@ class TestValidation:
                 return []
             _flow_decorators = {"trigger": [MagicMock()]}
 
-        with pytest.raises(DagsterException, match="trigger"):
-            _validate_workflow(MockFlow(), MockGraph())
+        # Should not raise — @trigger is handled at compile time via sensor generation
+        _validate_workflow(MockFlow(), MockGraph())
 
     def test_invalid_job_name_characters_raises(self):
         """Job names with spaces / special chars must raise."""
