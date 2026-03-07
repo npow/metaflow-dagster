@@ -102,20 +102,33 @@ def _run_cmd(
     extra_env: Optional[Dict[str, str]] = None,
 ) -> None:
     context.log.info("$ " + " ".join(str(c) for c in cmd))
-    result = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         env=_build_env(extra_env),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         cwd=os.path.dirname(FLOW_FILE) or ".",
     )
-    if result.stdout.strip():
-        context.log.info(result.stdout)
-    if result.stderr.strip():
-        context.log.info(result.stderr)
-    if result.returncode != 0:
+    try:
+        stdout, stderr = proc.communicate()
+    except BaseException:
+        # Op was cancelled, timed out, or worker is shutting down.
+        # Terminate the Metaflow subprocess so it does not become an orphan.
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+    if stdout.strip():
+        context.log.info(stdout)
+    if stderr.strip():
+        context.log.info(stderr)
+    if proc.returncode != 0:
         raise Exception(
-            f"Command failed (exit {{result.returncode}}):\\n{{result.stderr[-2000:]}}"
+            f"Command failed (exit {{proc.returncode}}):\\n{{stderr[-2000:]}}"
         )
 
 
@@ -186,19 +199,30 @@ def _run_step(
                 + [a for a in METAFLOW_TOP_ARGS if a != "--quiet"]
                 + ["package", "save", package_path]
             )
-            result = subprocess.run(
+            _pkg_proc = subprocess.Popen(
                 package_cmd,
                 env=_build_env(),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 cwd=os.path.dirname(FLOW_FILE) or ".",
             )
-            if result.returncode != 0:
+            try:
+                _pkg_stdout, _pkg_stderr = _pkg_proc.communicate()
+            except BaseException:
+                _pkg_proc.terminate()
+                try:
+                    _pkg_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _pkg_proc.kill()
+                    _pkg_proc.wait()
+                raise
+            if _pkg_proc.returncode != 0:
                 raise RuntimeError(
                     "Failed to build Metaflow code package:\\n"
-                    + (result.stderr or result.stdout)[-2000:]
+                    + (_pkg_stderr or _pkg_stdout)[-2000:]
                 )
-            meta_src = (result.stdout or "") + "\\n" + (result.stderr or "")
+            meta_src = (_pkg_stdout or "") + "\\n" + (_pkg_stderr or "")
             m = re.search(r"metadata:\\s*(\\{{.*\\}})", meta_src)
             package_metadata = (
                 m.group(1).strip()
