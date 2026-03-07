@@ -308,40 +308,6 @@ class TestValidation:
         with pytest.raises(MetaflowException, match="default value"):
             _validate_workflow(flow, graph)
 
-    def test_condition_decorator_raises(self, tmp_path):
-        """@condition is unsupported — compiler must raise NotSupportedException."""
-        import types
-
-        from metaflow import FlowSpec, step
-        from metaflow.graph import FlowGraph
-
-        from metaflow_extensions.dagster.plugins.dagster.dagster_cli import (
-            NotSupportedException,
-            _validate_workflow,
-        )
-
-        # Build a mock graph node with a @condition decorator
-        mock_deco = MagicMock()
-        mock_deco.name = "condition"
-
-        mock_node = MagicMock()
-        mock_node.parallel_foreach = False
-        mock_node.decorators = [mock_deco]
-        mock_node.name = "start"
-
-        # Build a mock flow and graph that yield this node
-        class MockGraph:
-            def __iter__(self):
-                return iter([mock_node])
-
-        class MockFlow:
-            def _get_parameters(self):
-                return []
-            _flow_decorators = {}
-
-        with pytest.raises(NotSupportedException, match="condition"):
-            _validate_workflow(MockFlow(), MockGraph())
-
     def test_slurm_decorator_raises(self):
         """@slurm is unsupported — must raise DagsterException."""
         from metaflow_extensions.dagster.plugins.dagster.dagster_cli import (
@@ -536,3 +502,94 @@ class TestNestedForeachFlow:
     def test_steps_in_compound_non_empty(self):
         compiler = _make_compiler(self.flow_cls)
         assert len(compiler._steps_in_compound()) > 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conditional (split-switch) flow
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestConditionalFlow:
+
+    def setup_method(self):
+        self.flow_cls = _import_flow("conditional_flow")
+        self.compiler = _make_compiler(self.flow_cls)
+        self.code = _compile(self.flow_cls)
+
+    # ── syntax & structure ──────────────────────────────────────────────────
+
+    def test_syntax_valid(self):
+        assert _is_valid_python(self.code)
+
+    def test_all_steps_present(self):
+        for step in ("start", "high_branch", "low_branch", "join", "end"):
+            assert f"op_{step}" in self.code
+
+    # ── start op (split-switch) ─────────────────────────────────────────────
+
+    def test_start_op_uses_is_required_false(self):
+        assert "is_required=False" in self.code
+
+    def test_start_op_yields_condition_branch(self):
+        assert "_get_condition_branch" in self.code
+        assert "yield Output(task_path, output_name=_branch)" in self.code
+
+    def test_start_op_branch_outputs_named(self):
+        assert '"high_branch": Out(str, is_required=False)' in self.code
+        assert '"low_branch": Out(str, is_required=False)' in self.code
+
+    # ── condition merge op ──────────────────────────────────────────────────
+
+    def test_join_uses_optional_inputs(self):
+        assert "Optional[str]" in self.code
+        assert "default_value=None" in self.code
+
+    def test_join_finds_non_none_input(self):
+        assert "next(p for p in" in self.code
+        assert "if p is not None" in self.code
+
+    # ── job wiring ───────────────────────────────────────────────────────────
+
+    def test_job_wires_branches_from_start(self):
+        assert "r_start.high_branch" in self.code or "r_start" in self.code
+        # branch vars are accessed via named outputs
+        assert ".high_branch" in self.code
+        assert ".low_branch" in self.code
+
+    def test_join_called_with_keyword_args(self):
+        # Merge op must receive both branch outputs as keyword args
+        assert "high_branch=" in self.code
+        assert "low_branch=" in self.code
+
+    # ── detection helpers ────────────────────────────────────────────────────
+
+    def test_is_condition_branch_detects_branch_steps(self):
+        from metaflow.graph import FlowGraph
+        graph = FlowGraph(self.flow_cls)
+        high_node = graph["high_branch"]
+        low_node = graph["low_branch"]
+        assert self.compiler._is_condition_branch(high_node) is True
+        assert self.compiler._is_condition_branch(low_node) is True
+
+    def test_is_condition_branch_false_for_start(self):
+        from metaflow.graph import FlowGraph
+        graph = FlowGraph(self.flow_cls)
+        start_node = graph["start"]
+        assert self.compiler._is_condition_branch(start_node) is False
+
+    def test_is_condition_merge_detects_join(self):
+        from metaflow.graph import FlowGraph
+        graph = FlowGraph(self.flow_cls)
+        join_node = graph["join"]
+        assert self.compiler._is_condition_merge(join_node) is True
+
+    def test_is_condition_merge_false_for_branch(self):
+        from metaflow.graph import FlowGraph
+        graph = FlowGraph(self.flow_cls)
+        high_node = graph["high_branch"]
+        assert self.compiler._is_condition_merge(high_node) is False
+
+    def test_condition_switch_name_returns_start(self):
+        from metaflow.graph import FlowGraph
+        graph = FlowGraph(self.flow_cls)
+        join_node = graph["join"]
+        assert self.compiler._condition_switch_name(join_node) == "start"

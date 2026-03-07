@@ -61,12 +61,26 @@ class SimpleFlow(FlowSpec):
     @step
     def end(self): pass
 
-# Split/join (branch)
+# Split/join (static branch)
 class BranchFlow(FlowSpec):
     @step
     def start(self):
         self.next(self.branch_a, self.branch_b)
     ...
+
+# Conditional (dynamic branch — only one path runs at runtime)
+class ConditionalFlow(FlowSpec):
+    value = Parameter("value", default=42, type=int)
+    @step
+    def start(self):
+        self.route = "high" if self.value >= 50 else "low"
+        self.next({"high": self.high_branch, "low": self.low_branch}, condition="route")
+    @step
+    def high_branch(self): ...
+    @step
+    def low_branch(self): ...
+    @step
+    def join(self): ...
 
 # Foreach fan-out
 class ForeachFlow(FlowSpec):

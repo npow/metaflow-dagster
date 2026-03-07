@@ -120,12 +120,6 @@ def _validate_workflow(flow, graph):
                 raise DagsterException(
                     f"Step *{node.name}* uses @slurm which is not supported with Dagster."
                 )
-            if deco.name == "condition":
-                raise NotSupportedException(
-                    f"Step *{node.name}* uses @condition which is not supported with Dagster. "
-                    "Conditional branching via @condition produces incorrect generated "
-                    "code and must be removed."
-                )
             if deco.name == "resources":
                 warnings.warn(
                     f"Step *{node.name}* uses @resources. Resource requirements are not enforced "

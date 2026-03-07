@@ -387,6 +387,29 @@ def _get_foreach_splits(run_id: str, step_name: str, task_id: str) -> int:
         ) from exc
 
 
+def _get_condition_branch(run_id: str, step_name: str, task_id: str) -> str:
+    """Read the condition branch taken from the local datastore files.
+
+    Reads the _transition artifact written by a split-switch step to determine
+    which branch was taken at runtime.
+    """
+    import gzip
+    import pickle
+    ds_root = _get_ds_root()
+    try:
+        data_json_path = os.path.join(ds_root, FLOW_NAME, run_id, step_name, task_id, "0.data.json")
+        with open(data_json_path) as fh:
+            data_map = json.load(fh)
+        sha = data_map["objects"]["_transition"]
+        blob_path = os.path.join(ds_root, FLOW_NAME, "data", sha[:2], sha)
+        with gzip.open(blob_path, "rb") as fh:
+            return str(pickle.load(fh))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read condition branch for {{step_name!r}}: {{exc}}"
+        ) from exc
+
+
 def _add_step_metadata(
     context: OpExecutionContext,
     task_path: str,
@@ -622,6 +645,31 @@ class DagsterCompiler:
         split_parent = node.split_parents[-1] if node.split_parents else None
         return split_parent is not None and self.graph[split_parent].type == "foreach"
 
+    def _is_condition_branch(self, node) -> bool:
+        """Return True if *node* is a linear branch step of a split-switch."""
+        return (
+            len(node.in_funcs) == 1
+            and self.graph[node.in_funcs[0]].type == "split-switch"
+        )
+
+    def _is_condition_merge(self, node) -> bool:
+        """Return True if *node* is the merge step that follows a split-switch."""
+        if len(node.in_funcs) < 2:
+            return False
+        parent_sets = [set(self.graph[p].in_funcs) for p in node.in_funcs]
+        common: set[str] = parent_sets[0].copy()
+        for s in parent_sets[1:]:
+            common &= s
+        return any(self.graph[p].type == "split-switch" for p in common)
+
+    def _condition_switch_name(self, node) -> str:
+        """Return the split-switch step name that this condition merge closes."""
+        parent_sets = [set(self.graph[p].in_funcs) for p in node.in_funcs]
+        common: set[str] = parent_sets[0].copy()
+        for s in parent_sets[1:]:
+            common &= s
+        return next(p for p in common if self.graph[p].type == "split-switch")
+
     def _render_op(self, node) -> str:
         # The "start" step is special regardless of its graph type
         if node.name == "start":
@@ -637,6 +685,8 @@ class DagsterCompiler:
             return self._render_split_op(node)
         elif ntype == "foreach":
             return self._render_foreach_op(node)
+        elif ntype == "split-switch":
+            return self._render_split_switch_op(node)
         else:
             raise NotImplementedError(f"Unsupported node type: {ntype!r} for step {node.name!r}")
 
@@ -765,6 +815,18 @@ class DagsterCompiler:
                 + '    for _i in range(num_splits):\n'
                 + '        yield DynamicOutput(f"{task_path}//_i={_i}", mapping_key=str(_i))\n'
             )
+        elif ntype == "split-switch":
+            branches = node.out_funcs
+            out_spec = "{" + ", ".join(f'"{b}": Out(str, is_required=False)' for b in branches) + "}"
+            deco = self._op_decorator_str(node, out_spec=out_spec)
+            return (
+                f'{deco}\n'
+                f'def {op_name}(context: OpExecutionContext{config_ann}):\n'
+                + common
+                + '    _add_step_metadata(context, task_path)\n'
+                + '    _branch = _get_condition_branch(run_id, "start", "1")\n'
+                + '    yield Output(task_path, output_name=_branch)\n'
+            )
         else:
             raise NotImplementedError(f"start step with type {ntype!r}")
 
@@ -789,6 +851,8 @@ class DagsterCompiler:
     # linear op ────────────────────────────────────────────────────────────────
 
     def _render_linear_op(self, node) -> str:
+        if self._is_condition_merge(node):
+            return self._render_condition_merge_op(node)
         parent_is_foreach = any(self.graph[p].type == "foreach" for p in node.in_funcs)
         in_name = node.in_funcs[0] if node.in_funcs else "upstream"
         tags = repr(self.tags)
@@ -919,6 +983,55 @@ class DagsterCompiler:
                 num_splits = _get_foreach_splits(run_id, "{node.name}", "1")
                 for _i in range(num_splits):
                     yield DynamicOutput(f"{{task_path}}//_i={{_i}}", mapping_key=str(_i))
+        """)
+
+    # split-switch op ──────────────────────────────────────────────────────────
+
+    def _render_split_switch_op(self, node) -> str:
+        """Generate @op for a mid-flow split-switch (conditional) step."""
+        in_name = node.in_funcs[0] if node.in_funcs else "upstream"
+        branches = node.out_funcs
+        out_spec = "{" + ", ".join(f'"{b}": Out(str, is_required=False)' for b in branches) + "}"
+        ins_spec = self._ins_spec(in_name)
+        tags = repr(self.tags)
+        env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
+        deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec=out_spec)
+        return dedent(f"""\
+            {deco}
+            def {self._op_name(node.name)}(context: OpExecutionContext, {in_name}: str):
+                run_id = {in_name}.split("/")[0]
+                task_path = _run_step(context, "{node.name}", run_id, {in_name}, "1",
+                    retry_count=context.retry_number, max_user_code_retries={max_retries},
+                    tags={tags}, extra_env={env_code})
+                _add_step_metadata(context, task_path)
+                _branch = _get_condition_branch(run_id, "{node.name}", "1")
+                yield Output(task_path, output_name=_branch)
+        """)
+
+    # condition merge op ───────────────────────────────────────────────────────
+
+    def _render_condition_merge_op(self, node) -> str:
+        """Generate @op for a step that merges condition branches (follows split-switch)."""
+        branches = node.in_funcs
+        ins_parts = [f'"{p}": In(Optional[str], default_value=None)' for p in branches]
+        ins_spec = "{" + ", ".join(ins_parts) + "}"
+        args = ", ".join(branches)
+        paths_list = "[" + ", ".join(branches) + "]"
+        tags = repr(self.tags)
+        env_code = self._extra_env_code(node)
+        max_retries, _ = self._get_retry_info(node)
+        deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec="Out(str)")
+        return dedent(f"""\
+            {deco}
+            def {self._op_name(node.name)}(context: OpExecutionContext, {args}) -> str:
+                input_path = next(p for p in {paths_list} if p is not None)
+                run_id = input_path.split("/")[0]
+                task_path = _run_step(context, "{node.name}", run_id, input_path, "1",
+                    retry_count=context.retry_number, max_user_code_retries={max_retries},
+                    tags={tags}, extra_env={env_code})
+                _add_step_metadata(context, task_path)
+                return task_path
         """)
 
     # ── Foreach chain analysis ─────────────────────────────────────────────────
@@ -1170,7 +1283,7 @@ class DagsterCompiler:
                 var = "r_start"
                 lines.append(f"{var} = {op_call}()")
                 var_map["start"] = var
-                if ntype == "split":
+                if ntype in ("split", "split-switch"):
                     for branch in node.out_funcs:
                         var_map[f"_branch_{branch}"] = f"{var}.{branch}"
                 elif ntype == "foreach" and "start" in chains and len(chains["start"]) > 1:
@@ -1196,6 +1309,9 @@ class DagsterCompiler:
                 if foreach_parent is not None:
                     dyn_var = var_map[foreach_parent]
                     lines.append(f"{var} = {dyn_var}.map({op_call})")
+                elif self._is_condition_merge(node):
+                    kwargs = ", ".join(f"{p}={var_map.get(p, p)}" for p in node.in_funcs)
+                    lines.append(f"{var} = {op_call}({kwargs})")
                 else:
                     pvar = self._resolve_input(node, var_map)
                     lines.append(f"{var} = {op_call}({pvar})")
@@ -1203,6 +1319,15 @@ class DagsterCompiler:
 
             # ── split step ────────────────────────────────────────────────────
             elif ntype == "split":
+                pvar = self._resolve_input(node, var_map)
+                var = f"r_{node.name}"
+                lines.append(f"{var} = {op_call}({pvar})")
+                var_map[node.name] = var
+                for branch in node.out_funcs:
+                    var_map[f"_branch_{branch}"] = f"{var}.{branch}"
+
+            # ── split-switch (condition) step ─────────────────────────────────
+            elif ntype == "split-switch":
                 pvar = self._resolve_input(node, var_map)
                 var = f"r_{node.name}"
                 lines.append(f"{var} = {op_call}({pvar})")
