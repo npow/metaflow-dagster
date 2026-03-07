@@ -16,6 +16,7 @@ Harness structure:
   - _read_artifact()    → read a gzip+pickle artifact directly from disk
 """
 
+import ast
 import gzip
 import importlib
 import importlib.util
@@ -217,7 +218,6 @@ class TestCompilation:
             ds = tmp_path / f"ds_{flow.stem}"
             ds.mkdir()
             _compile(flow, out, ds)
-            import ast
             try:
                 ast.parse(out.read_text())
             except SyntaxError as e:
@@ -238,141 +238,145 @@ class TestCompilation:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # End-to-end execution tests (run via `dagster job execute`)
+#
+# Each class uses a class-scoped fixture that compiles once and runs the job
+# once, sharing the compiled definitions file and datastore across all test
+# methods in that class.
 # ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="class")
+def _linear_env(tmp_path_factory):
+    base = tmp_path_factory.mktemp("linear")
+    out = base / "linear_dagster.py"
+    ds = base / "ds"
+    ds.mkdir()
+    _compile(FLOWS_DIR / "linear_flow.py", out, ds)
+    _run_job_cli("LinearFlow", out, ds, base / "dagster_home")
+    return out, ds
+
 
 @pytest.mark.e2e
 class TestLinearFlow:
 
-    def test_executes_successfully(self, tmp_path):
-        out = tmp_path / "linear_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "linear_flow.py", out, ds)
-        _run_job_cli("LinearFlow", out, ds, tmp_path / "dagster_home")
+    def test_executes_successfully(self, _linear_env):
+        pass  # execution in fixture; success means no exception was raised
 
-    def test_all_steps_ran(self, tmp_path):
-        out = tmp_path / "linear_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "linear_flow.py", out, ds)
-        _run_job_cli("LinearFlow", out, ds, tmp_path / "dagster_home")
+    def test_all_steps_ran(self, _linear_env):
+        out, ds = _linear_env
         run_id = _latest_run_id(ds, "LinearFlow")
         assert (ds / "LinearFlow" / run_id / "start" / "1").exists()
         assert (ds / "LinearFlow" / run_id / "process" / "1").exists()
         assert (ds / "LinearFlow" / run_id / "end" / "1").exists()
 
-    def test_metaflow_artifacts_persisted(self, tmp_path):
-        out = tmp_path / "linear_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "linear_flow.py", out, ds)
-        _run_job_cli("LinearFlow", out, ds, tmp_path / "dagster_home")
+    def test_metaflow_artifacts_persisted(self, _linear_env):
+        out, ds = _linear_env
         run_id = _latest_run_id(ds, "LinearFlow")
         value = _read_artifact(ds, "LinearFlow", run_id, "process", "result")
         assert value == "hello from start -> process"
 
 
+@pytest.fixture(scope="class")
+def _branching_env(tmp_path_factory):
+    base = tmp_path_factory.mktemp("branching")
+    out = base / "branching_dagster.py"
+    ds = base / "ds"
+    ds.mkdir()
+    _compile(FLOWS_DIR / "branching_flow.py", out, ds)
+    _run_job_cli("BranchingFlow", out, ds, base / "dagster_home")
+    return out, ds
+
+
 @pytest.mark.e2e
 class TestBranchingFlow:
 
-    def test_executes_successfully(self, tmp_path):
-        out = tmp_path / "branching_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "branching_flow.py", out, ds)
-        _run_job_cli("BranchingFlow", out, ds, tmp_path / "dagster_home")
+    def test_executes_successfully(self, _branching_env):
+        pass  # execution in fixture; success means no exception was raised
 
-    def test_both_branches_ran(self, tmp_path):
-        out = tmp_path / "branching_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "branching_flow.py", out, ds)
-        _run_job_cli("BranchingFlow", out, ds, tmp_path / "dagster_home")
+    def test_both_branches_ran(self, _branching_env):
+        out, ds = _branching_env
         run_id = _latest_run_id(ds, "BranchingFlow")
         assert (ds / "BranchingFlow" / run_id / "branch_a" / "1").exists()
         assert (ds / "BranchingFlow" / run_id / "branch_b" / "1").exists()
         assert (ds / "BranchingFlow" / run_id / "join" / "1").exists()
 
-    def test_join_artifacts_correct(self, tmp_path):
-        out = tmp_path / "branching_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "branching_flow.py", out, ds)
-        _run_job_cli("BranchingFlow", out, ds, tmp_path / "dagster_home")
+    def test_join_artifacts_correct(self, _branching_env):
+        out, ds = _branching_env
         run_id = _latest_run_id(ds, "BranchingFlow")
         assert _read_artifact(ds, "BranchingFlow", run_id, "join", "merged_a") == 20
         assert _read_artifact(ds, "BranchingFlow", run_id, "join", "merged_b") == 15
 
 
+@pytest.fixture(scope="class")
+def _foreach_env(tmp_path_factory):
+    base = tmp_path_factory.mktemp("foreach")
+    out = base / "foreach_dagster.py"
+    ds = base / "ds"
+    ds.mkdir()
+    _compile(FLOWS_DIR / "foreach_flow.py", out, ds)
+    _run_job_cli("ForeachFlow", out, ds, base / "dagster_home")
+    return out, ds
+
+
 @pytest.mark.e2e
 class TestForeachFlow:
 
-    def test_executes_successfully(self, tmp_path):
-        out = tmp_path / "foreach_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "foreach_flow.py", out, ds)
-        _run_job_cli("ForeachFlow", out, ds, tmp_path / "dagster_home")
+    def test_executes_successfully(self, _foreach_env):
+        pass  # execution in fixture; success means no exception was raised
 
-    def test_all_items_processed(self, tmp_path):
-        out = tmp_path / "foreach_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "foreach_flow.py", out, ds)
-        _run_job_cli("ForeachFlow", out, ds, tmp_path / "dagster_home")
+    def test_all_items_processed(self, _foreach_env):
+        out, ds = _foreach_env
         run_id = _latest_run_id(ds, "ForeachFlow")
         process_item_dir = ds / "ForeachFlow" / run_id / "process_item"
         tasks = [d for d in process_item_dir.iterdir() if d.is_dir()]
         assert len(tasks) >= 3, f"Expected >=3 process_item tasks, found {len(tasks)}"
 
-    def test_foreach_artifacts_correct(self, tmp_path):
-        out = tmp_path / "foreach_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "foreach_flow.py", out, ds)
-        _run_job_cli("ForeachFlow", out, ds, tmp_path / "dagster_home")
+    def test_foreach_artifacts_correct(self, _foreach_env):
+        out, ds = _foreach_env
         run_id = _latest_run_id(ds, "ForeachFlow")
         results = _read_artifact(ds, "ForeachFlow", run_id, "join", "results")
         assert sorted(results) == ["APPLE", "BANANA", "CHERRY"]
 
 
+@pytest.fixture(scope="class")
+def _param_env_default(tmp_path_factory):
+    base = tmp_path_factory.mktemp("param_default")
+    out = base / "param_dagster.py"
+    ds = base / "ds"
+    ds.mkdir()
+    _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
+    _run_job_cli("ParametrizedFlow", out, ds, base / "dagster_home")
+    return out, ds
+
+
+@pytest.fixture(scope="class")
+def _param_env_custom(tmp_path_factory):
+    base = tmp_path_factory.mktemp("param_custom")
+    out = base / "param_dagster.py"
+    ds = base / "ds"
+    ds.mkdir()
+    _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
+    run_config = {
+        "ops": {"op_start": {"config": {"greeting": "Hi", "count": 5}}}
+    }
+    _run_job_cli("ParametrizedFlow", out, ds, base / "dagster_home", run_config=run_config)
+    return out, ds
+
+
 @pytest.mark.e2e
 class TestParametrizedFlow:
 
-    def test_default_parameters(self, tmp_path):
-        out = tmp_path / "param_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
-        _run_job_cli("ParametrizedFlow", out, ds, tmp_path / "dagster_home")
+    def test_default_parameters(self, _param_env_default):
+        pass  # execution in fixture; success means no exception was raised
 
-    def test_custom_parameters(self, tmp_path):
-        out = tmp_path / "param_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
-        run_config = {
-            "ops": {
-                "op_start": {
-                    "config": {
-                        "greeting": "Hi",
-                        "count": 5,
-                    }
-                }
-            }
-        }
-        _run_job_cli("ParametrizedFlow", out, ds, tmp_path / "dagster_home",
-                     run_config=run_config)
+    def test_custom_parameters(self, _param_env_custom):
+        out, ds = _param_env_custom
         run_id = _latest_run_id(ds, "ParametrizedFlow")
         messages = _read_artifact(ds, "ParametrizedFlow", run_id, "start", "messages")
         assert len(messages) == 5
         assert all(m.startswith("Hi #") for m in messages)
 
-    def test_parameter_config_schema(self, tmp_path):
-        out = tmp_path / "param_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
+    def test_parameter_config_schema(self, _param_env_default):
+        out, ds = _param_env_default
         mod = _load_module(out)
         config_cls = mod.ParametrizedFlowConfig
         fields = config_cls.__fields__ if hasattr(config_cls, "__fields__") else config_cls.model_fields
@@ -448,15 +452,22 @@ class TestDecoratorCompilation:
         assert "retry_policy=" not in code
 
 
+@pytest.fixture(scope="class")
+def _retry_env(tmp_path_factory):
+    base = tmp_path_factory.mktemp("retry")
+    out = base / "retry_dagster.py"
+    ds = base / "ds"
+    ds.mkdir()
+    _compile(FLOWS_DIR / "retry_flow.py", out, ds)
+    _run_job_cli("RetryFlow", out, ds, base / "dagster_home")
+    return out, ds
+
+
 @pytest.mark.e2e
 class TestDecoratorExecution:
 
-    def test_retry_flow_executes(self, tmp_path):
-        out = tmp_path / "retry_dagster.py"
-        ds = tmp_path / "ds"
-        ds.mkdir()
-        _compile(FLOWS_DIR / "retry_flow.py", out, ds)
-        _run_job_cli("RetryFlow", out, ds, tmp_path / "dagster_home")
+    def test_retry_flow_executes(self, _retry_env):
+        out, ds = _retry_env
         run_id = _latest_run_id(ds, "RetryFlow")
         result_val = _read_artifact(ds, "RetryFlow", run_id, "process", "result")
         assert result_val == 2

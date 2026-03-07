@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
+import os
 import sys
 from typing import TYPE_CHECKING, ClassVar, Optional
 
@@ -11,6 +14,22 @@ from metaflow.runner.utils import get_lower_level_group, handle_timeout, tempora
 if TYPE_CHECKING:
     import metaflow
     import metaflow.runner.deployer_impl
+
+
+@contextlib.contextmanager
+def _patched_env(**vars: str):
+    """Temporarily override environment variables, restoring originals on exit."""
+    old = {k: os.environ.get(k) for k in vars}
+    try:
+        for k, v in vars.items():
+            os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 class DagsterTriggeredRun(TriggeredRun):
@@ -38,38 +57,30 @@ class DagsterTriggeredRun(TriggeredRun):
     @property
     def run(self):
         """Retrieve the Run object, applying deployer env vars so local metadata works."""
-        import os
         import metaflow
         from metaflow.exception import MetaflowNotFound
 
         env_vars = getattr(self.deployer, "env_vars", {}) or {}
         meta_type = env_vars.get("METAFLOW_DEFAULT_METADATA")
         sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+        if meta_type == "local" and sysroot is None:
+            sysroot = os.path.expanduser("~")
 
-        old_meta = os.environ.get("METAFLOW_DEFAULT_METADATA")
-        old_sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+        patch = {}
+        if meta_type:
+            patch["METAFLOW_DEFAULT_METADATA"] = meta_type
+        if sysroot:
+            patch["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
+
         try:
-            if meta_type:
-                os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
-                metaflow.metadata(meta_type)
-            if meta_type == "local" and sysroot is None:
-                sysroot = os.path.expanduser("~")
-            if sysroot:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
-            return metaflow.Run(self.pathspec, _namespace_check=False)
+            with _patched_env(**patch):
+                if meta_type:
+                    metaflow.metadata(meta_type)
+                return metaflow.Run(self.pathspec, _namespace_check=False)
         except MetaflowNotFound:
             return None
         except Exception:
             return None
-        finally:
-            if old_meta is None:
-                os.environ.pop("METAFLOW_DEFAULT_METADATA", None)
-            else:
-                os.environ["METAFLOW_DEFAULT_METADATA"] = old_meta
-            if old_sysroot is None:
-                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
-            else:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
 
     @property
     def status(self) -> Optional[str]:
@@ -92,7 +103,6 @@ class DagsterDeployedFlow(DeployedFlow):
     @property
     def id(self) -> str:
         """Deployment identifier encoding all info needed for ``from_deployment``."""
-        import json
         additional_info = getattr(self.deployer, "additional_info", {}) or {}
         return json.dumps({
             "name": self.name,
@@ -107,7 +117,6 @@ class DagsterDeployedFlow(DeployedFlow):
 
         The identifier is the JSON string returned by ``deployed_flow.id``.
         """
-        import json
         from .dagster_deployer import DagsterDeployer
 
         info = json.loads(identifier)

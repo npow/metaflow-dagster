@@ -96,6 +96,26 @@ def _build_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return e
 
 
+def _communicate(proc: subprocess.Popen) -> tuple:
+    """Wait for *proc* to finish, killing it cleanly on any interruption.
+
+    If the calling thread is interrupted (op cancelled, timeout, SIGTERM),
+    sends SIGTERM to the child and waits up to 10 s before escalating to
+    SIGKILL, then re-raises so the op is marked failed rather than leaving
+    the Metaflow subprocess as an orphan.
+    """
+    try:
+        return proc.communicate()
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+
+
 def _run_cmd(
     context: OpExecutionContext,
     cmd: List[str],
@@ -110,18 +130,7 @@ def _run_cmd(
         text=True,
         cwd=os.path.dirname(FLOW_FILE) or ".",
     )
-    try:
-        stdout, stderr = proc.communicate()
-    except BaseException:
-        # Op was cancelled, timed out, or worker is shutting down.
-        # Terminate the Metaflow subprocess so it does not become an orphan.
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        raise
+    stdout, stderr = _communicate(proc)
     if stdout.strip():
         context.log.info(stdout)
     if stderr.strip():
@@ -207,16 +216,7 @@ def _run_step(
                 text=True,
                 cwd=os.path.dirname(FLOW_FILE) or ".",
             )
-            try:
-                _pkg_stdout, _pkg_stderr = _pkg_proc.communicate()
-            except BaseException:
-                _pkg_proc.terminate()
-                try:
-                    _pkg_proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    _pkg_proc.kill()
-                    _pkg_proc.wait()
-                raise
+            _pkg_stdout, _pkg_stderr = _communicate(_pkg_proc)
             if _pkg_proc.returncode != 0:
                 raise RuntimeError(
                     "Failed to build Metaflow code package:\\n"
