@@ -79,8 +79,6 @@ class DagsterTriggeredRun(TriggeredRun):
                 return metaflow.Run(self.pathspec, _namespace_check=False)
         except MetaflowNotFound:
             return None
-        except Exception:
-            return None
 
     @property
     def status(self) -> Optional[str]:
@@ -119,7 +117,17 @@ class DagsterDeployedFlow(DeployedFlow):
         """
         from .dagster_deployer import DagsterDeployer
 
-        info = json.loads(identifier)
+        try:
+            info = json.loads(identifier)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(
+                "Invalid Dagster deployment identifier (expected JSON): %r" % identifier
+            ) from exc
+        for required in ("flow_file", "name", "flow_name"):
+            if required not in info:
+                raise ValueError(
+                    "Deployment identifier missing required field %r" % required
+                )
         flow_file = info["flow_file"]
         deployer = DagsterDeployer(flow_file=flow_file, deployer_kwargs={})
         deployer.name = info["name"]

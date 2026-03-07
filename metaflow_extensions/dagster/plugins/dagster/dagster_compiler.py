@@ -42,6 +42,7 @@ Source : {flow_file}
 DO NOT EDIT — re-generate with:
     python {flow_basename} dagster create {output_file}
 """
+import atexit
 import hashlib
 import json
 import os
@@ -55,6 +56,7 @@ from dagster import (
     DynamicOut,
     DynamicOutput,
     In,
+    MetadataValue,
     Nothing,
     OpExecutionContext,
     Out,
@@ -65,6 +67,7 @@ from dagster import (
     op,
     schedule,
 )
+from metaflow.decorators import extract_step_decorator_from_decospec
 
 # ── Flow constants ─────────────────────────────────────────────────────────────
 FLOW_FILE = {flow_file!r}
@@ -263,6 +266,7 @@ def _run_step(
             # Keep the local tarball alive so TarballStager (used by @sandbox)
             # can deliver the code package via backend.upload() without S3.
             code_package_cache["local_path"] = package_path
+            atexit.register(lambda p=package_path: os.path.exists(p) and os.unlink(p))
         except Exception:
             try:
                 os.unlink(package_path)
@@ -298,7 +302,7 @@ def _run_step(
                         for a in METAFLOW_TOP_ARGS
                         if a.startswith("--namespace=")
                     ),
-                    "",
+                    None,
                 ),
             }}
             if split_index is not None:
@@ -334,8 +338,6 @@ def _run_step(
 
     cli_args = _CLIArgs()
 
-    from metaflow.decorators import extract_step_decorator_from_decospec
-
     for spec in STEP_DECORATOR_SPECS.get(step_name, []):
         deco, _ = extract_step_decorator_from_decospec(spec)
         # Set instance attributes that step_init would normally provide.
@@ -352,9 +354,14 @@ def _run_step(
             deco.package_metadata = package_metadata
             deco.package_sha = package_sha
             deco.package_url = package_url
-            # Propagate to the class so TarballStager delivery works for @sandbox.
-            if package_local_path and hasattr(type(deco), "package_local_path"):
-                type(deco).package_local_path = package_local_path
+            # Propagate to the defining class so TarballStager delivery works for @sandbox.
+            # Traverse MRO to find the class that declares package_local_path (e.g.
+            # SandboxDecorator), not a subclass that merely inherits it.
+            if package_local_path:
+                for _cls in type(deco).__mro__:
+                    if "package_local_path" in _cls.__dict__:
+                        _cls.package_local_path = package_local_path
+                        break
         deco.runtime_step_cli(cli_args, retry_count, max_user_code_retries, None)
 
     cmd = cli_args.get_args()
@@ -404,7 +411,6 @@ def _add_step_metadata(
     values — they remain in the Metaflow datastore. Also emits a Python
     snippet showing how to retrieve each artifact via the Metaflow Task API.
     """
-    from dagster import MetadataValue
     parts = task_path.split("/")
     if len(parts) < 3:
         return
@@ -420,7 +426,8 @@ def _add_step_metadata(
     try:
         with open(data_json_path) as fh:
             objects = json.load(fh).get("objects", {{}})
-    except Exception:
+    except Exception as _exc:
+        context.log.warning("Could not read artifact metadata for %s: %s" % (task_path, _exc))
         return
     keys = [k for k in objects if not k.startswith("_")]
     if not keys:
@@ -438,8 +445,8 @@ def _add_step_metadata(
     kwargs = {{"output_name": output_name}} if output_name is not None else {{}}
     try:
         context.add_output_metadata(meta, **kwargs)
-    except Exception:
-        pass
+    except Exception as _exc:
+        context.log.warning("Could not attach output metadata for %s: %s" % (task_path, _exc))
 
 
 '''
@@ -613,18 +620,21 @@ class DagsterCompiler:
     # ── Op rendering ───────────────────────────────────────────────────────────
 
     def _topological_order(self):
-        visited = set()
-        queue = [self.graph["start"]]
-        result = []
-        while queue:
-            node = queue.pop(0)
-            if node.name in visited:
-                continue
-            visited.add(node.name)
-            result.append(node)
-            for child in node.out_funcs:
-                queue.append(self.graph[child])
-        return result
+        if not hasattr(self, "_topo_cache"):
+            from collections import deque
+            visited = set()
+            queue = deque([self.graph["start"]])
+            result = []
+            while queue:
+                node = queue.popleft()
+                if node.name in visited:
+                    continue
+                visited.add(node.name)
+                result.append(node)
+                for child in node.out_funcs:
+                    queue.append(self.graph[child])
+            self._topo_cache = result
+        return self._topo_cache
 
     def _op_name(self, step_name: str) -> str:
         return f"op_{step_name}"
@@ -945,6 +955,11 @@ class DagsterCompiler:
     # ── Foreach chain analysis ─────────────────────────────────────────────────
 
     def _foreach_chains(self) -> Dict[str, List]:
+        if not hasattr(self, "_foreach_chains_cache"):
+            self._foreach_chains_cache = self._compute_foreach_chains()
+        return self._foreach_chains_cache
+
+    def _compute_foreach_chains(self) -> Dict[str, List]:
         """Return {outermost_foreach: chain} for every outermost foreach in the flow.
 
         Each chain is a list of (foreach_name, body_name, join_name) tuples ordered
@@ -1405,8 +1420,3 @@ class DagsterCompiler:
             )
         """)
 
-    # ── Utilities ──────────────────────────────────────────────────────────────
-
-    def _tags_args_code(self) -> str:
-        # Kept for backward compatibility with tests/imports; callers use repr(self.tags).
-        return repr(self.tags)
