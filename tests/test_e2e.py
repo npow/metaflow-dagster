@@ -1,19 +1,19 @@
 """
 End-to-end tests for the metaflow-dagster integration.
 
-Each test:
+Each execution test:
   1. Compiles a Metaflow flow → Dagster definitions file (real CLI invocation).
-  2. Loads the file as a Python module (real import).
-  3. Executes the Dagster job (real execute_in_process, no mocks).
-  4. Verifies both Dagster success AND Metaflow artifact correctness.
+  2. Executes the job via `dagster job execute` (out-of-process, real orchestrator).
+  3. Verifies Metaflow artifact correctness by reading the local datastore.
+
+Compilation tests (TestCompilation) are fast — they only check generated code,
+no execution.  Execution tests are marked @pytest.mark.e2e.
 
 Harness structure:
-  - compile_and_load()  → shared helper used by all tests
-  - test_linear_*       → linear flow tests
-  - test_branching_*    → split/join tests
-  - test_foreach_*      → foreach/dynamic tests
-  - test_parametrized_* → parameter passing tests
-  - test_compile_*      → compilation correctness tests (no execution)
+  - _compile()          → invoke `python flow.py dagster create`
+  - _run_job_cli()      → invoke `dagster job execute -f ... -j ...`
+  - _latest_run_id()    → find the most recent run in the local datastore
+  - _read_artifact()    → read a gzip+pickle artifact directly from disk
 """
 
 import gzip
@@ -60,6 +60,51 @@ def _compile(flow_path: Path, out_path: Path, ds_root: Path, extra_args=None) ->
         )
 
 
+def _run_job_cli(job_name: str, out_path: Path, ds_root: Path, dagster_home: Path,
+                 run_config: dict | None = None) -> None:
+    """Execute a compiled Dagster definitions file via `dagster job execute`.
+
+    Uses a real out-of-process Dagster execution engine backed by a temporary
+    SQLite instance in dagster_home.  Does NOT require a running webserver or
+    daemon.
+    """
+    dagster_home.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "DAGSTER_HOME": str(dagster_home),
+        "METAFLOW_DEFAULT_DATASTORE": "local",
+        "METAFLOW_DATASTORE_SYSROOT_LOCAL": str(ds_root),
+        "METAFLOW_DEFAULT_METADATA": "local",
+    }
+    cmd = [
+        sys.executable, "-m", "dagster", "job", "execute",
+        "-f", str(out_path),
+        "-j", job_name,
+    ]
+    if run_config:
+        config_file = dagster_home / "run_config.json"
+        config_file.write_text(json.dumps(run_config))
+        cmd += ["-c", str(config_file)]
+
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise AssertionError(
+            f"dagster job execute failed (job={job_name!r}):\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
+def _latest_run_id(ds_root: Path, flow_name: str) -> str:
+    """Return the most recently written run_id from the local datastore."""
+    flow_dir = ds_root / flow_name
+    if not flow_dir.exists():
+        raise AssertionError(f"No runs found for {flow_name!r} under {ds_root}")
+    runs = [d for d in flow_dir.iterdir() if d.is_dir() and d.name != "data"]
+    if not runs:
+        raise AssertionError(f"No run directories found in {flow_dir}")
+    return sorted(runs, key=lambda d: d.stat().st_mtime)[-1].name
+
+
 def _load_module(path: Path) -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("_dagster_defs", str(path))
     mod = importlib.util.module_from_spec(spec)
@@ -67,24 +112,10 @@ def _load_module(path: Path) -> types.ModuleType:
     return mod
 
 
-def _run_job(job, run_config=None):
-    result = job.execute_in_process(run_config=run_config or {})
-    assert result.success, (
-        "Job failed. Events:\n"
-        + "\n".join(
-            f"  {e.event_type}: {e.message}"
-            for e in result.all_node_events
-            if e.event_type.value in ("STEP_FAILURE", "RUN_FAILURE", "PIPELINE_FAILURE")
-        )
-    )
-    return result
-
-
-def _read_artifact(ds_root: Path, flow_name: str, run_id: str, step: str, artifact: str, task_id: str = "1"):
+def _read_artifact(ds_root: Path, flow_name: str, run_id: str, step: str, artifact: str,
+                   task_id: str = "1"):
     """Read a Metaflow artifact directly from the local datastore.
 
-    Bypasses the Metaflow metadata service entirely — reads the content-addressed
-    gzip+pickle files that the step commands write to disk.
     Layout:
       <ds_root>/<flow>/<run>/<step>/<task>/0.data.json  → name→sha mapping
       <ds_root>/<flow>/data/<sha[:2]>/<sha>             → gzip+pickle blob
@@ -120,20 +151,13 @@ class TestCompilation:
         _compile(FLOWS_DIR / "linear_flow.py", out, ds)
         code = out.read_text()
 
-        # Must have preamble comment
         assert "DO NOT EDIT" in code
         assert "LinearFlow" in code
-
-        # Must define all three ops
         assert "def op_start(" in code
         assert "def op_process(" in code
         assert "def op_end(" in code
-
-        # Must define the job
         assert "@job" in code
         assert "def LinearFlow(" in code
-
-        # Must have Definitions export
         assert "defs = Definitions(" in code
 
     def test_branching_compiles(self, tmp_path):
@@ -148,7 +172,6 @@ class TestCompilation:
         assert "def op_branch_b(" in code
         assert "def op_join(" in code
         assert "def op_end(" in code
-        # Split op should fan out to both branches
         assert '"branch_a": Out(str)' in code
         assert '"branch_b": Out(str)' in code
 
@@ -172,18 +195,15 @@ class TestCompilation:
         _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
         code = out.read_text()
 
-        # Config class
         assert "class ParametrizedFlowConfig(Config):" in code
         assert "greeting" in code
         assert "count" in code
-        # Config used in start op
         assert "ParametrizedFlowConfig" in code
 
     def test_custom_job_name(self, tmp_path):
         out = tmp_path / "named_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
-        # --name is an option of the `create` subcommand, placed after the output file arg
         _compile(
             FLOWS_DIR / "linear_flow.py", out, ds,
             extra_args=["--name", "my_custom_job"],
@@ -197,7 +217,6 @@ class TestCompilation:
             ds = tmp_path / f"ds_{flow.stem}"
             ds.mkdir()
             _compile(flow, out, ds)
-            # ast.parse will raise SyntaxError if invalid
             import ast
             try:
                 ast.parse(out.read_text())
@@ -218,9 +237,10 @@ class TestCompilation:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# End-to-end execution tests
+# End-to-end execution tests (run via `dagster job execute`)
 # ──────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.e2e
 class TestLinearFlow:
 
     def test_executes_successfully(self, tmp_path):
@@ -228,41 +248,31 @@ class TestLinearFlow:
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "linear_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.LinearFlow)
-        assert result.success
+        _run_job_cli("LinearFlow", out, ds, tmp_path / "dagster_home")
 
     def test_all_steps_ran(self, tmp_path):
         out = tmp_path / "linear_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "linear_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.LinearFlow)
-        ran = {e.node_name for e in result.all_node_events if hasattr(e, "node_name")}
-        assert "op_start" in ran
-        assert "op_process" in ran
-        assert "op_end" in ran
+        _run_job_cli("LinearFlow", out, ds, tmp_path / "dagster_home")
+        run_id = _latest_run_id(ds, "LinearFlow")
+        assert (ds / "LinearFlow" / run_id / "start" / "1").exists()
+        assert (ds / "LinearFlow" / run_id / "process" / "1").exists()
+        assert (ds / "LinearFlow" / run_id / "end" / "1").exists()
 
     def test_metaflow_artifacts_persisted(self, tmp_path):
         out = tmp_path / "linear_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "linear_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.LinearFlow)
-
-        # op_start returns "run_id/start/1" — extract run_id from it
-        start_output = result.output_for_node("op_start")
-        run_id = start_output.split("/")[0]
-
+        _run_job_cli("LinearFlow", out, ds, tmp_path / "dagster_home")
+        run_id = _latest_run_id(ds, "LinearFlow")
         value = _read_artifact(ds, "LinearFlow", run_id, "process", "result")
         assert value == "hello from start -> process"
 
 
+@pytest.mark.e2e
 class TestBranchingFlow:
 
     def test_executes_successfully(self, tmp_path):
@@ -270,40 +280,31 @@ class TestBranchingFlow:
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "branching_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.BranchingFlow)
-        assert result.success
+        _run_job_cli("BranchingFlow", out, ds, tmp_path / "dagster_home")
 
     def test_both_branches_ran(self, tmp_path):
         out = tmp_path / "branching_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "branching_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.BranchingFlow)
-        ran = {e.node_name for e in result.all_node_events if hasattr(e, "node_name")}
-        assert "op_branch_a" in ran
-        assert "op_branch_b" in ran
-        assert "op_join" in ran
+        _run_job_cli("BranchingFlow", out, ds, tmp_path / "dagster_home")
+        run_id = _latest_run_id(ds, "BranchingFlow")
+        assert (ds / "BranchingFlow" / run_id / "branch_a" / "1").exists()
+        assert (ds / "BranchingFlow" / run_id / "branch_b" / "1").exists()
+        assert (ds / "BranchingFlow" / run_id / "join" / "1").exists()
 
     def test_join_artifacts_correct(self, tmp_path):
         out = tmp_path / "branching_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "branching_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.BranchingFlow)
-        # op_start for branching has multiple named outputs — use output_name
-        start_output = result.output_for_node("op_start", output_name="branch_a")
-        run_id = start_output.split("/")[0]
-
+        _run_job_cli("BranchingFlow", out, ds, tmp_path / "dagster_home")
+        run_id = _latest_run_id(ds, "BranchingFlow")
         assert _read_artifact(ds, "BranchingFlow", run_id, "join", "merged_a") == 20
         assert _read_artifact(ds, "BranchingFlow", run_id, "join", "merged_b") == 15
 
 
+@pytest.mark.e2e
 class TestForeachFlow:
 
     def test_executes_successfully(self, tmp_path):
@@ -311,47 +312,31 @@ class TestForeachFlow:
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "foreach_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.ForeachFlow)
-        assert result.success
+        _run_job_cli("ForeachFlow", out, ds, tmp_path / "dagster_home")
 
     def test_all_items_processed(self, tmp_path):
         out = tmp_path / "foreach_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "foreach_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.ForeachFlow)
-
-        # Three DynamicOutputs → three op_process_item invocations
-        process_events = [
-            e for e in result.all_node_events
-            if hasattr(e, "node_name") and e.node_name
-            and e.node_name.startswith("op_process_item")
-        ]
-        step_successes = [e for e in process_events if "SUCCESS" in str(e.event_type)]
-        assert len(step_successes) >= 3, (
-            f"Expected 3 process_item successes, got {len(step_successes)}"
-        )
+        _run_job_cli("ForeachFlow", out, ds, tmp_path / "dagster_home")
+        run_id = _latest_run_id(ds, "ForeachFlow")
+        process_item_dir = ds / "ForeachFlow" / run_id / "process_item"
+        tasks = [d for d in process_item_dir.iterdir() if d.is_dir()]
+        assert len(tasks) >= 3, f"Expected >=3 process_item tasks, found {len(tasks)}"
 
     def test_foreach_artifacts_correct(self, tmp_path):
         out = tmp_path / "foreach_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "foreach_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.ForeachFlow)
-        # op_start for foreach yields DynamicOutputs — use op_join's output instead
-        join_output = result.output_for_node("op_join")
-        run_id = join_output.split("/")[0]
-
+        _run_job_cli("ForeachFlow", out, ds, tmp_path / "dagster_home")
+        run_id = _latest_run_id(ds, "ForeachFlow")
         results = _read_artifact(ds, "ForeachFlow", run_id, "join", "results")
         assert sorted(results) == ["APPLE", "BANANA", "CHERRY"]
 
 
+@pytest.mark.e2e
 class TestParametrizedFlow:
 
     def test_default_parameters(self, tmp_path):
@@ -359,18 +344,13 @@ class TestParametrizedFlow:
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.ParametrizedFlow)
-        assert result.success
+        _run_job_cli("ParametrizedFlow", out, ds, tmp_path / "dagster_home")
 
     def test_custom_parameters(self, tmp_path):
         out = tmp_path / "param_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
-        mod = _load_module(out)
-
         run_config = {
             "ops": {
                 "op_start": {
@@ -381,12 +361,9 @@ class TestParametrizedFlow:
                 }
             }
         }
-        result = _run_job(mod.ParametrizedFlow, run_config=run_config)
-        assert result.success
-
-        start_output = result.output_for_node("op_start")
-        run_id = start_output.split("/")[0]
-
+        _run_job_cli("ParametrizedFlow", out, ds, tmp_path / "dagster_home",
+                     run_config=run_config)
+        run_id = _latest_run_id(ds, "ParametrizedFlow")
         messages = _read_artifact(ds, "ParametrizedFlow", run_id, "start", "messages")
         assert len(messages) == 5
         assert all(m.startswith("Hi #") for m in messages)
@@ -397,8 +374,6 @@ class TestParametrizedFlow:
         ds.mkdir()
         _compile(FLOWS_DIR / "parametrized_flow.py", out, ds)
         mod = _load_module(out)
-
-        # Verify Config class has the right fields
         config_cls = mod.ParametrizedFlowConfig
         fields = config_cls.__fields__ if hasattr(config_cls, "__fields__") else config_cls.model_fields
         assert "greeting" in fields
@@ -409,95 +384,79 @@ class TestParametrizedFlow:
 # Decorator feature tests (@retry, @timeout, @environment, @project, --workflow-timeout)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class TestDecoratorFeatures:
+class TestDecoratorCompilation:
 
     def test_retry_generates_retry_policy(self, tmp_path):
-        """@retry(times=3) produces RetryPolicy(max_retries=3) on the op."""
         out = tmp_path / "retry_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "retry_flow.py", out, ds)
         code = out.read_text()
-
         assert "RetryPolicy" in code
         assert "max_retries=3" in code
 
     def test_retry_delay_generates_delay(self, tmp_path):
-        """@retry(minutes_between_retries=2) produces delay=120 in RetryPolicy."""
         out = tmp_path / "retry_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "retry_flow.py", out, ds)
         code = out.read_text()
-
         assert "delay=120" in code
 
     def test_timeout_generates_op_tag(self, tmp_path):
-        """@timeout(seconds=120) produces dagster/op_execution_timeout tag."""
         out = tmp_path / "retry_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "retry_flow.py", out, ds)
         code = out.read_text()
-
         assert "dagster/op_execution_timeout" in code
         assert '"120"' in code
 
     def test_environment_vars_in_extra_env(self, tmp_path):
-        """@environment(vars={...}) embeds vars as extra_env in the op."""
         out = tmp_path / "retry_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "retry_flow.py", out, ds)
         code = out.read_text()
-
         assert "MY_VAR" in code
         assert "hello" in code
         assert "OTHER" in code
 
     def test_retry_count_uses_context_retry_number(self, tmp_path):
-        """retry_count=context.retry_number is passed to every _run_step call."""
         out = tmp_path / "retry_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "retry_flow.py", out, ds)
         code = out.read_text()
-
         assert "retry_count=context.retry_number" in code
 
     def test_workflow_timeout_sets_job_tag(self, tmp_path):
-        """--workflow-timeout adds dagster/max_runtime tag to the @job."""
         out = tmp_path / "timeout_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "linear_flow.py", out, ds, extra_args=["--workflow-timeout", "3600"])
         code = out.read_text()
-
         assert "dagster/max_runtime" in code
         assert "3600" in code
 
     def test_no_retry_no_retry_policy_on_ops(self, tmp_path):
-        """Steps without @retry do not emit retry_policy= on their ops."""
         out = tmp_path / "linear_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "linear_flow.py", out, ds)
         code = out.read_text()
-
         assert "retry_policy=" not in code
 
+
+@pytest.mark.e2e
+class TestDecoratorExecution:
+
     def test_retry_flow_executes(self, tmp_path):
-        """A flow with @retry/@timeout/@environment decorators compiles and runs."""
         out = tmp_path / "retry_dagster.py"
         ds = tmp_path / "ds"
         ds.mkdir()
         _compile(FLOWS_DIR / "retry_flow.py", out, ds)
-        mod = _load_module(out)
-
-        result = _run_job(mod.RetryFlow)
-        assert result.success
-
-        start_output = result.output_for_node("op_start")
-        run_id = start_output.split("/")[0]
+        _run_job_cli("RetryFlow", out, ds, tmp_path / "dagster_home")
+        run_id = _latest_run_id(ds, "RetryFlow")
         result_val = _read_artifact(ds, "RetryFlow", run_id, "process", "result")
         assert result_val == 2

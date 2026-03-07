@@ -30,6 +30,9 @@ include = ["metaflow_extensions*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-timeout = 120
+timeout = 300
 log_cli = true
 log_cli_level = "INFO"
+markers = [
+    "e2e: end-to-end tests that compile flows and execute them via dagster job execute",
+]
