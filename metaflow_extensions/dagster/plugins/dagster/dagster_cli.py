@@ -204,14 +204,16 @@ def dagster(obj):
 @click.pass_obj
 def create(obj, file, name=None, tags=None, user_namespace=None,
            with_decorators=None, workflow_timeout=None, deployer_attribute_file=None):
+    job_name = _resolve_job_name(name, obj.flow.name, obj.flow)
+
     if file is None:
-        file = f"{obj.flow.name.lower()}_dagster.py"
+        # Use the job name (not just flow name) to avoid collisions when the same
+        # flow is compiled multiple times with different configs/project names.
+        file = f"{job_name.lower()}_dagster.py"
     if os.path.abspath(sys.argv[0]) == os.path.abspath(file):
         raise MetaflowException(
             "Dagster output file cannot be the same as the flow file."
         )
-
-    job_name = _resolve_job_name(name, obj.flow.name, obj.flow)
 
     _validate_workflow(obj.flow, obj.graph)
 
@@ -250,10 +252,20 @@ def create(obj, file, name=None, tags=None, user_namespace=None,
     )
 
     if deployer_attribute_file:
+        # The "name" field becomes deployer.name, which the test framework uses
+        # as the deployment identifier for DeployedFlow.from_deployment().
+        # We embed the full JSON blob so that from_deployment() can reconstruct
+        # the deployer without needing the original flow file.
+        identifier = json.dumps({
+            "name": job_name,
+            "flow_name": obj.flow.name,
+            "flow_file": flow_file,
+            "definitions_file": os.path.abspath(file),
+        })
         with open(deployer_attribute_file, "w") as f:
             json.dump(
                 {
-                    "name": job_name,
+                    "name": identifier,
                     "flow_name": obj.flow.name,
                     "metadata": "{}",
                     "additional_info": {"definitions_file": os.path.abspath(file)},
@@ -302,7 +314,9 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
     config_yaml_lines = []
     for kv in (run_params or []):
         k, _, v = kv.partition("=")
-        config_yaml_lines.append(f"{k.strip()}: {v.strip()}")
+        # Always quote values as YAML strings. Dagster expects String scalars for
+        # flow parameters; unquoted numeric literals would be parsed as int/float.
+        config_yaml_lines.append(f"{k.strip()}: {json.dumps(v.strip())}")
 
     config_file = None
     try:

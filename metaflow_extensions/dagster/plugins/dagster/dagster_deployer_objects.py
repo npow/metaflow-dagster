@@ -94,22 +94,32 @@ class DagsterDeployedFlow(DeployedFlow):
 
     TYPE: ClassVar[str | None] = "dagster"
 
+    def __init__(self, deployer):
+        super().__init__(deployer=deployer)
+        # deployer.name is the full JSON identifier blob (set by dagster create).
+        # Extract the human-readable job name from it for display purposes.
+        try:
+            info = json.loads(self.name)
+            self.name = info.get("name", self.name)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass  # name is already a plain string (e.g. set via from_deployment)
+
     @property
     def id(self) -> str:
-        """Deployment identifier encoding all info needed for ``from_deployment``."""
-        additional_info = getattr(self.deployer, "additional_info", {}) or {}
-        return json.dumps({
-            "name": self.name,
-            "flow_name": self.flow_name,
-            "flow_file": getattr(self.deployer, "flow_file", None),
-            "definitions_file": additional_info.get("definitions_file"),
-        })
+        """Deployment identifier encoding all info needed for ``from_deployment``.
+
+        Returns ``deployer.name`` directly: the ``create`` command embeds the
+        full JSON blob (name, flow_name, flow_file, definitions_file) there so
+        the identifier is self-contained and survives a process restart.
+        """
+        return self.deployer.name
 
     @classmethod
     def from_deployment(cls, identifier: str, metadata: str | None = None) -> DagsterDeployedFlow:
         """Recover a DagsterDeployedFlow from a deployment identifier.
 
-        The identifier is the JSON string returned by ``deployed_flow.id``.
+        The identifier is the JSON string returned by ``deployed_flow.deployer.name``
+        or ``deployed_flow.id``, both of which contain the full deployment info.
         """
         from .dagster_deployer import DagsterDeployer
 
@@ -126,7 +136,8 @@ class DagsterDeployedFlow(DeployedFlow):
                 )
         flow_file = info["flow_file"]
         deployer = DagsterDeployer(flow_file=flow_file, deployer_kwargs={})
-        deployer.name = info["name"]
+        # Store the full identifier JSON as deployer.name so that .id round-trips.
+        deployer.name = identifier
         deployer.flow_name = info["flow_name"]
         deployer.metadata = metadata or "{}"
         deployer.additional_info = {
