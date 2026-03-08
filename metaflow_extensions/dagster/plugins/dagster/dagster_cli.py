@@ -311,7 +311,8 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
                 suffix=".yaml", delete=False, mode="w"
             ) as tmp:
                 tmp.write("ops:\n")
-                tmp.write("  start:\n")
+                # The compiler names ops as op_<step_name> (e.g. op_start).
+                tmp.write("  op_start:\n")
                 tmp.write("    config:\n")
                 for line in config_yaml_lines:
                     tmp.write(f"      {line}\n")
