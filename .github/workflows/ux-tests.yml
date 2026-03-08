@@ -29,8 +29,9 @@ jobs:
       - name: Pin Metaflow local datastore root
         run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
 
-      # Dagster runs jobs in-process via execute_in_process() — no external
-      # scheduler service is required.
+      # Dagster jobs are executed via execute_job() with SyncInMemoryRunLauncher
+      # and a SQLite-backed DagsterInstance.  This runs Metaflow steps as real
+      # subprocesses via the multiprocess executor — no daemon or webserver needed.
 
       - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
         with:

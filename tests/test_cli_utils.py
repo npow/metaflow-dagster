@@ -34,7 +34,9 @@ class TestFixLocalStepMetadata:
             None,
             create=True,
         ):
-            with patch.dict(os.environ, {"HOME": str(tmp_path)}):
+            # Clear METAFLOW_DATASTORE_SYSROOT_LOCAL so HOME-based path is used
+            with patch.dict(os.environ, {"HOME": str(tmp_path)}, clear=False):
+                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
                 # No run directory exists — should silently succeed
                 _fix_local_step_metadata("TestFlow", "run123")
 
@@ -52,7 +54,8 @@ class TestFixLocalStepMetadata:
             str(ds_dir.relative_to(tmp_path)),
             create=True,
         ):
-            with patch.dict(os.environ, {"HOME": str(tmp_path)}):
+            with patch.dict(os.environ, {"HOME": str(tmp_path)}, clear=False):
+                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
                 _fix_local_step_metadata(flow_name, run_id)
 
         step_self = step_dir / "_meta" / "_self.json"
@@ -74,7 +77,8 @@ class TestFixLocalStepMetadata:
             str(ds_dir.relative_to(tmp_path)),
             create=True,
         ):
-            with patch.dict(os.environ, {"HOME": str(tmp_path)}):
+            with patch.dict(os.environ, {"HOME": str(tmp_path)}, clear=False):
+                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
                 _fix_local_step_metadata(flow_name, run_id)
 
         task_self = task_dir / "_meta" / "_self.json"
@@ -99,7 +103,8 @@ class TestFixLocalStepMetadata:
             str(ds_dir.relative_to(tmp_path)),
             create=True,
         ):
-            with patch.dict(os.environ, {"HOME": str(tmp_path)}):
+            with patch.dict(os.environ, {"HOME": str(tmp_path)}, clear=False):
+                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
                 _fix_local_step_metadata(flow_name, run_id)
 
         data = json.loads((step_meta_dir / "_self.json").read_text())
@@ -118,7 +123,8 @@ class TestFixLocalStepMetadata:
             str(ds_dir.relative_to(tmp_path)),
             create=True,
         ):
-            with patch.dict(os.environ, {"HOME": str(tmp_path)}):
+            with patch.dict(os.environ, {"HOME": str(tmp_path)}, clear=False):
+                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
                 # Should not raise or create _self.json inside _meta dir
                 _fix_local_step_metadata(flow_name, run_id)
 

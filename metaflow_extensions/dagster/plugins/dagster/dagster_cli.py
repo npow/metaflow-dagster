@@ -1,12 +1,9 @@
 import hashlib
 import json
 import os
-import re
-import subprocess
 import sys
 import tempfile
 import time
-import uuid
 
 from metaflow._vendor import click
 from metaflow.exception import MetaflowException
@@ -36,10 +33,21 @@ def _fix_local_step_metadata(flow_name, run_id):
     """
     try:
         from metaflow.metaflow_config import DATASTORE_LOCAL_DIR
-        home = os.path.expanduser("~")
         local_dir = DATASTORE_LOCAL_DIR or ".metaflow"
-        run_dir = os.path.join(home, local_dir, flow_name, run_id)
-        if not os.path.isdir(run_dir):
+        # Build candidate run directories to search:
+        # 1. METAFLOW_DATASTORE_SYSROOT_LOCAL/<flow>/<run>  (direct sysroot, e.g. when sysroot
+        #    is already under .metaflow, or the metadata provider uses it directly)
+        # 2. METAFLOW_DATASTORE_SYSROOT_LOCAL/.metaflow/<flow>/<run>  (sysroot without .metaflow)
+        # 3. ~/<DATASTORE_LOCAL_DIR>/<flow>/<run>  (legacy default path)
+        candidates = []
+        env_sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+        if env_sysroot:
+            candidates.append(os.path.join(env_sysroot, flow_name, run_id))
+            candidates.append(os.path.join(env_sysroot, local_dir, flow_name, run_id))
+        home = os.path.expanduser("~")
+        candidates.append(os.path.join(home, local_dir, flow_name, run_id))
+        run_dir = next((c for c in candidates if os.path.isdir(c)), None)
+        if run_dir is None:
             return
         ts = int(time.time() * 1000)
         for step_name in os.listdir(run_dir):
@@ -291,6 +299,63 @@ def create(obj, file, name=None, tags=None, user_namespace=None,  # pragma: no c
             )
 
 
+def _ensure_dagster_home():
+    """Return a DAGSTER_HOME path, creating a temporary one with SyncInMemoryRunLauncher if needed.
+
+    If DAGSTER_HOME is already set and exists, it is returned unchanged so that
+    callers can bring their own dagster.yaml (e.g. CI setups with a real daemon).
+    Otherwise a temporary directory is created and configured with:
+      - SQLite storage (single-process, no daemon required)
+      - SyncInMemoryRunLauncher (executes runs synchronously via multiprocess executor)
+      - DefaultRunCoordinator (no queue daemon required)
+
+    Returns (dagster_home_path, cleanup_func).  The caller must invoke cleanup_func()
+    when the run is complete to remove the temporary directory (if one was created).
+    """
+    existing = os.environ.get("DAGSTER_HOME")
+    if existing and os.path.isdir(existing):
+        return existing, lambda: None
+
+    import atexit
+    tmp_home = tempfile.mkdtemp(prefix="mf_dagster_home_")
+
+    def _cleanup():
+        import shutil
+        shutil.rmtree(tmp_home, ignore_errors=True)
+
+    storage_dir = os.path.join(tmp_home, "storage")
+    os.makedirs(storage_dir, exist_ok=True)
+    dagster_yaml = os.path.join(tmp_home, "dagster.yaml")
+    with open(dagster_yaml, "w") as f:
+        f.write(
+            f"storage:\n"
+            f"  sqlite:\n"
+            f"    base_dir: {storage_dir}\n"
+            f"run_launcher:\n"
+            f"  module: dagster._core.launcher.sync_in_memory_run_launcher\n"
+            f"  class: SyncInMemoryRunLauncher\n"
+            f"run_coordinator:\n"
+            f"  module: dagster._core.run_coordinator.default_run_coordinator\n"
+            f"  class: DefaultRunCoordinator\n"
+            f"telemetry:\n"
+            f"  enabled: false\n"
+        )
+    atexit.register(_cleanup)
+    return tmp_home, _cleanup
+
+
+def _build_run_config(run_params):
+    """Build a Dagster run config dict from key=value run_params strings."""
+    if not run_params:
+        return None
+    ops_config = {}
+    for kv in run_params:
+        k, _, v = kv.partition("=")
+        ops_config[k.strip()] = v.strip()
+    # Parameters are passed as op-level config to op_start.
+    return {"ops": {"op_start": {"config": ops_config}}}
+
+
 @dagster.command(help="Trigger a Dagster job execution.")
 @click.option(
     "--definitions-file",
@@ -320,59 +385,52 @@ def create(obj, file, name=None, tags=None, user_namespace=None,  # pragma: no c
 def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attribute_file=None):  # pragma: no cover
     if definitions_file is None:
         definitions_file = f"{obj.flow.name.lower()}_dagster.py"
+    definitions_file = os.path.abspath(definitions_file)
     resolved_job_name = _resolve_job_name(job_name, obj.flow.name, obj.flow)
 
-    cmd = [
-        sys.executable, "-m", "dagster", "job", "execute",
-        "-f", definitions_file,
-        "-j", resolved_job_name,
-    ]
+    dagster_home, cleanup = _ensure_dagster_home()
+    old_dagster_home = os.environ.get("DAGSTER_HOME")
+    os.environ["DAGSTER_HOME"] = dagster_home
 
-    config_yaml_lines = []
-    for kv in (run_params or []):
-        k, _, v = kv.partition("=")
-        # Always quote values as YAML strings. Dagster expects String scalars for
-        # flow parameters; unquoted numeric literals would be parsed as int/float.
-        config_yaml_lines.append(f"{k.strip()}: {json.dumps(v.strip())}")
-
-    config_file = None
     try:
-        if config_yaml_lines:
-            with tempfile.NamedTemporaryFile(
-                suffix=".yaml", delete=False, mode="w"
-            ) as tmp:
-                tmp.write("ops:\n")
-                # The compiler names ops as op_<step_name> (e.g. op_start).
-                tmp.write("  op_start:\n")
-                tmp.write("    config:\n")
-                for line in config_yaml_lines:
-                    tmp.write(f"      {line}\n")
-                config_file = tmp.name
-            cmd += ["-c", config_file]
+        from dagster import DagsterInstance
+        from dagster._core.definitions.reconstruct import ReconstructableJob
+        from dagster._core.execution.api import execute_job
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        # Echo output so it's visible when show_output is on
-        if result.stdout:
-            sys.stderr.write(result.stdout)
-        if result.stderr:
-            sys.stderr.write(result.stderr)
+        recon_job = ReconstructableJob.for_file(definitions_file, resolved_job_name)
+        run_config = _build_run_config(run_params)
 
-        if result.returncode != 0:
-            raise DagsterException(
-                f"dagster job execute returned exit code {result.returncode}."
+        with DagsterInstance.get() as instance:
+            result = execute_job(
+                recon_job,
+                instance=instance,
+                run_config=run_config,
             )
-    finally:
-        if config_file and os.path.exists(config_file):
-            os.unlink(config_file)
 
-    # Extract the Dagster run UUID from the job execute output so we can
-    # derive the same deterministic Metaflow run-id used inside the job.
-    combined_output = (result.stdout or "") + (result.stderr or "")
-    match = re.search(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", combined_output)
-    if match:
-        run_id = "dagster-" + hashlib.sha1(match.group(1).encode()).hexdigest()[:12]
-    else:
-        run_id = f"dagster-{uuid.uuid4()}"
+        if not result.success:
+            # Collect failure messages for a helpful error
+            failure_msgs = []
+            for event in result.all_events:
+                if event.is_failure:
+                    esd = getattr(event, "event_specific_data", None)
+                    err = getattr(esd, "error", None)
+                    if err:
+                        failure_msgs.append(str(err.message))
+            detail = "; ".join(failure_msgs) if failure_msgs else "(no details)"
+            raise DagsterException(
+                f"Dagster job {resolved_job_name!r} failed. {detail}"
+            )
+
+        dagster_run_id = result.run_id
+    finally:
+        if old_dagster_home is None:
+            os.environ.pop("DAGSTER_HOME", None)
+        else:
+            os.environ["DAGSTER_HOME"] = old_dagster_home
+
+    # Derive the deterministic Metaflow run-id from the Dagster UUID.
+    # This matches _make_run_id() in the generated definitions file.
+    run_id = "dagster-" + hashlib.sha1(dagster_run_id.encode()).hexdigest()[:12]
 
     # Fix local metadata: when steps are run individually via CLI, step-level
     # _self.json files may not be created. Create them so Metaflow's client
@@ -506,35 +564,45 @@ def resume(  # pragma: no cover
             bold=True,
         )
 
-        cmd = [
-            sys.executable, "-m", "dagster", "job", "execute",
-            "-f", resume_defs_file,
-            "-j", resolved_job_name,
-        ]
+        dagster_home, _cleanup = _ensure_dagster_home()
+        old_dagster_home = os.environ.get("DAGSTER_HOME")
+        os.environ["DAGSTER_HOME"] = dagster_home
+        try:
+            from dagster import DagsterInstance
+            from dagster._core.definitions.reconstruct import ReconstructableJob
+            from dagster._core.execution.api import execute_job
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.stdout:
-            sys.stderr.write(result.stdout)
-        if result.stderr:
-            sys.stderr.write(result.stderr)
+            recon_job = ReconstructableJob.for_file(resume_defs_file, resolved_job_name)
 
-        if result.returncode != 0:
-            raise DagsterException(
-                f"dagster job execute returned exit code {result.returncode}."
-            )
+            with DagsterInstance.get() as instance:
+                result_obj = execute_job(recon_job, instance=instance)
+
+            if not result_obj.success:
+                failure_msgs = []
+                for event in result_obj.all_events:
+                    if event.is_failure:
+                        esd = getattr(event, "event_specific_data", None)
+                        err = getattr(esd, "error", None)
+                        if err:
+                            failure_msgs.append(str(err.message))
+                detail = "; ".join(failure_msgs) if failure_msgs else "(no details)"
+                raise DagsterException(
+                    f"Dagster job {resolved_job_name!r} resume failed. {detail}"
+                )
+            dagster_run_uuid = result_obj.run_id
+        finally:
+            if old_dagster_home is None:
+                os.environ.pop("DAGSTER_HOME", None)
+            else:
+                os.environ["DAGSTER_HOME"] = old_dagster_home
     finally:
         try:
             os.unlink(resume_defs_file)
         except Exception:
             pass
 
-    # Derive the new Metaflow run-id from the Dagster UUID in the output
-    combined_output = (result.stdout or "") + (result.stderr or "")
-    match = re.search(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", combined_output)
-    if match:
-        new_run_id = "dagster-" + hashlib.sha1(match.group(1).encode()).hexdigest()[:12]
-    else:
-        new_run_id = f"dagster-{uuid.uuid4()}"
+    # Derive the new Metaflow run-id from the Dagster UUID.
+    new_run_id = "dagster-" + hashlib.sha1(dagster_run_uuid.encode()).hexdigest()[:12]
 
     _fix_local_step_metadata(obj.flow.name, new_run_id)
 
