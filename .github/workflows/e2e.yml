@@ -37,4 +37,5 @@ jobs:
           pytest -v -m e2e \
             --timeout=300 \
             --tb=short \
+            --no-cov \
             -x
