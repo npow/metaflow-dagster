@@ -147,7 +147,9 @@ class DagsterDeployedFlow(DeployedFlow):
         DagsterTriggeredRun
         """
         # Convert kwargs to "key=value" strings for --run-param.
-        run_params = tuple(f"{k}={v}" for k, v in kwargs.items())
+        # Must be a list (not tuple): the click_api only serializes list values
+        # correctly for multiple=True options; tuples fall through to str(v).
+        run_params = list(f"{k}={v}" for k, v in kwargs.items())
 
         # Retrieve definitions_file from additional_info stored during create.
         additional_info = getattr(self.deployer, "additional_info", {}) or {}

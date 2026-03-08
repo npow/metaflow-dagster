@@ -35,7 +35,7 @@ jobs:
       - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
         with:
           metaflow-ref: npow/corral-devstack
-          extra-install: "."
+          extra-install: ".[test]"
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
           ux-test-config: |
             backends:
