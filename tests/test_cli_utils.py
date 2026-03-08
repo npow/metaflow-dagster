@@ -122,6 +122,12 @@ class TestFixLocalStepMetadata:
                 # Should not raise or create _self.json inside _meta dir
                 _fix_local_step_metadata(flow_name, run_id)
 
+    def test_silently_handles_exception(self, tmp_path):
+        # Simulate an exception inside the try block — should not propagate.
+        with patch("os.path.expanduser", side_effect=RuntimeError("boom")):
+            # Should not raise
+            _fix_local_step_metadata("TestFlow", "run123")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # _resolve_job_name

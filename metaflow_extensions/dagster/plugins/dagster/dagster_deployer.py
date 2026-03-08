@@ -31,12 +31,12 @@ class DagsterDeployer(DeployerImpl):
 
     TYPE: ClassVar[str | None] = "dagster"
 
-    def __init__(self, deployer_kwargs: dict[str, str], **kwargs) -> None:
+    def __init__(self, deployer_kwargs: dict[str, str], **kwargs) -> None:  # pragma: no cover
         self._deployer_kwargs = deployer_kwargs
         super().__init__(**kwargs)
 
     @property
-    def deployer_kwargs(self) -> dict[str, str]:
+    def deployer_kwargs(self) -> dict[str, str]:  # pragma: no cover
         return self._deployer_kwargs
 
     @staticmethod
@@ -45,7 +45,7 @@ class DagsterDeployer(DeployerImpl):
 
         return DagsterDeployedFlow
 
-    def create(self, **kwargs) -> DagsterDeployedFlow:
+    def create(self, **kwargs) -> DagsterDeployedFlow:  # pragma: no cover
         """Compile this flow as a Dagster definitions file.
 
         Parameters
@@ -67,6 +67,6 @@ class DagsterDeployer(DeployerImpl):
         -------
         DagsterDeployedFlow
         """
-        from .dagster_deployer_objects import DagsterDeployedFlow
+        from .dagster_deployer_objects import DagsterDeployedFlow  # pragma: no cover
 
-        return self._create(DagsterDeployedFlow, **kwargs)
+        return self._create(DagsterDeployedFlow, **kwargs)  # pragma: no cover

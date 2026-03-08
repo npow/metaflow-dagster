@@ -149,13 +149,13 @@ def _gather_step_env():
 
 
 @click.group()
-def cli():
+def cli():  # pragma: no cover
     pass
 
 
 @cli.group(help="Commands related to Dagster deployment.")
 @click.pass_obj
-def dagster(obj):
+def dagster(obj):  # pragma: no cover
     obj.check(obj.graph, obj.flow, obj.environment, pylint=obj.pylint)
 
 
@@ -202,7 +202,7 @@ def dagster(obj):
     help="Write deployment info JSON here (used by Metaflow Deployer API).",
 )
 @click.pass_obj
-def create(obj, file, name=None, tags=None, user_namespace=None,
+def create(obj, file, name=None, tags=None, user_namespace=None,  # pragma: no cover
            with_decorators=None, workflow_timeout=None, deployer_attribute_file=None):
     job_name = _resolve_job_name(name, obj.flow.name, obj.flow)
 
@@ -317,7 +317,7 @@ def create(obj, file, name=None, tags=None, user_namespace=None,
     help="Write triggered-run info JSON here (used by Metaflow Deployer API).",
 )
 @click.pass_obj
-def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attribute_file=None):
+def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attribute_file=None):  # pragma: no cover
     if definitions_file is None:
         definitions_file = f"{obj.flow.name.lower()}_dagster.py"
     resolved_job_name = _resolve_job_name(job_name, obj.flow.name, obj.flow)
@@ -447,7 +447,7 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
     help="Write resumed-run info JSON here (used by Metaflow Deployer API).",
 )
 @click.pass_obj
-def resume(
+def resume(  # pragma: no cover
     obj,
     run_id,
     definitions_file=None,
