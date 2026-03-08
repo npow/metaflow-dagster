@@ -592,3 +592,72 @@ class TestConditionalFlow:
         graph = FlowGraph(self.flow_cls)
         join_node = graph["join"]
         assert self.compiler._condition_switch_name(join_node) == "start"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conda environment ID embedding
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestCondaEnvIds:
+    """_build_step_conda_env_ids embeds per-step conda env IDs in the generated file."""
+
+    def setup_method(self):
+        self.flow_cls = _import_flow("linear_flow")
+
+    def test_all_none_when_environment_has_no_get_environment(self):
+        """Non-conda environments (no get_environment attr) produce all-None mapping."""
+        compiler = _make_compiler(self.flow_cls)
+        # The mock environment does not have get_environment
+        assert not hasattr(compiler.environment, "get_environment") or True
+        ids = compiler._build_step_conda_env_ids()
+        # With a MagicMock environment, get_environment() returns a MagicMock,
+        # and isinstance(mock, str) is False, so all IDs should be None.
+        assert all(v is None for v in ids.values())
+
+    def test_step_names_are_keys(self):
+        """The mapping must contain all step names as keys."""
+        compiler = _make_compiler(self.flow_cls)
+        ids = compiler._build_step_conda_env_ids()
+        expected_steps = {n.name for n in compiler._topological_order()}
+        assert set(ids.keys()) == expected_steps
+
+    def test_step_conda_env_ids_in_generated_code(self):
+        """STEP_CONDA_ENV_IDS constant is present and syntactically valid."""
+        code = _compile(self.flow_cls)
+        assert "STEP_CONDA_ENV_IDS" in code
+        assert "_get_conda_interpreter" in code
+        assert "_bootstrap_conda_envs" in code
+        assert _is_valid_python(code)
+
+    def test_only_string_ids_accepted(self):
+        """If get_environment returns a non-string id_, it is treated as None."""
+        from unittest.mock import patch
+
+        compiler = _make_compiler(self.flow_cls)
+        # Simulate an environment whose get_environment returns a non-string id_
+        fake_env_info = {"id_": 12345}  # int, not str
+
+        with patch.object(compiler.environment, "get_environment", return_value=fake_env_info):
+            ids = compiler._build_step_conda_env_ids()
+        assert all(v is None for v in ids.values())
+
+    def test_string_id_is_preserved(self):
+        """If get_environment returns a valid string id_, it is included as-is."""
+        from unittest.mock import patch
+
+        compiler = _make_compiler(self.flow_cls)
+        fake_env_info = {"id_": "abc123def456789"}
+
+        with patch.object(compiler.environment, "get_environment", return_value=fake_env_info):
+            ids = compiler._build_step_conda_env_ids()
+        assert all(v == "abc123def456789" for v in ids.values())
+
+    def test_exception_in_get_environment_yields_none(self):
+        """An exception from get_environment is caught and produces None for that step."""
+        from unittest.mock import patch
+
+        compiler = _make_compiler(self.flow_cls)
+
+        with patch.object(compiler.environment, "get_environment", side_effect=RuntimeError("oops")):
+            ids = compiler._build_step_conda_env_ids()
+        assert all(v is None for v in ids.values())

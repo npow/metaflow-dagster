@@ -41,6 +41,7 @@ jobs:
       - name: Add conda bin to PATH for subprocess access
         run: echo "/usr/share/miniconda/bin" >> $GITHUB_PATH
 
+
       - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
         with:
           metaflow-ref: npow/corral-devstack
@@ -49,7 +50,10 @@ jobs:
           # Use a higher per-test timeout (600s) because dagster jobs run steps
           # as subprocesses via the multiprocess executor and can be slow on
           # shared CI runners, especially for flows with retries.
-          pytest-args: "-n 4 -v --tb=short --timeout=600 --cov-fail-under=0"
+          # --dist=loadfile keeps tests from the same file on the same worker so
+          # both @conda tests (in test_basic.py) run sequentially on one worker,
+          # preventing micromamba repodata SOLV file races between parallel workers.
+          pytest-args: "-n 4 --dist=loadfile -v --tb=short --timeout=600 --cov-fail-under=0"
           ux-test-config: |
             backends:
               - name: dagster

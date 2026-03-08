@@ -90,6 +90,88 @@ METAFLOW_STEP_ENV: Dict[str, str] = {step_env!r}
 STEP_DECORATOR_SPECS: Dict[str, List[str]] = {step_decorator_specs!r}
 STEP_WITH_DECORATORS: Dict[str, List[str]] = {step_with_decorators!r}
 
+# Per-step conda environment IDs, embedded at compile time.
+# Maps step_name -> conda environment id_ (the sha256-based identifier used by
+# Metaflow/Micromamba) or None if the step does not use a conda environment.
+# Used by _get_conda_interpreter() to locate the correct Python interpreter.
+STEP_CONDA_ENV_IDS: Dict[str, Optional[str]] = {step_conda_env_ids!r}
+
+
+# ── Conda helpers ──────────────────────────────────────────────────────────────
+
+_CONDA_BOOTSTRAP_DONE: bool = False
+_CONDA_INTERP_CACHE: Dict[str, Optional[str]] = {{}}
+
+
+def _bootstrap_conda_envs() -> None:
+    """Bootstrap all conda environments for this flow by running \'package save\'.
+
+    MetaflowPackage.__init__ calls environment.init_environment() which invokes
+    micromamba to solve and install all step environments.  Running \'package save\'
+    is the lightest-weight way to trigger that bootstrap without executing user code.
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+        pkg_path = tmp.name
+    try:
+        pkg_cmd = (
+            [sys.executable, FLOW_FILE]
+            + [a for a in METAFLOW_TOP_ARGS if a != "--quiet"]
+            + ["package", "save", pkg_path]
+        )
+        proc = subprocess.Popen(
+            pkg_cmd,
+            env=_build_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=os.path.dirname(FLOW_FILE) or ".",
+        )
+        _communicate(proc)
+        # Ignore errors — if bootstrap failed the step subprocess will
+        # report a clear error; we do not want to mask it here.
+    finally:
+        try:
+            os.unlink(pkg_path)
+        except Exception:
+            pass
+
+
+def _get_conda_interpreter(step_name: str) -> Optional[str]:
+    """Return the conda Python interpreter path for *step_name*, or None.
+
+    On the first call (per Dagster process) all conda environments are bootstrapped
+    via \'package save\' so that micromamba can resolve their on-disk paths.
+    Subsequent calls reuse the cached result.
+    """
+    global _CONDA_BOOTSTRAP_DONE
+
+    env_id = STEP_CONDA_ENV_IDS.get(step_name)
+    if not env_id:
+        return None
+
+    if step_name in _CONDA_INTERP_CACHE:
+        return _CONDA_INTERP_CACHE[step_name]
+
+    if not _CONDA_BOOTSTRAP_DONE:
+        _bootstrap_conda_envs()
+        _CONDA_BOOTSTRAP_DONE = True
+
+    interp: Optional[str] = None
+    try:
+        from metaflow.plugins.pypi.micromamba import Micromamba
+        mm = Micromamba()
+        env_path = mm.path_to_environment(env_id)
+        if env_path:
+            candidate = os.path.join(env_path, "bin", "python")
+            if os.path.isfile(candidate):
+                interp = candidate
+    except Exception:
+        pass
+
+    _CONDA_INTERP_CACHE[step_name] = interp
+    return interp
+
 
 # ── Execution helpers ──────────────────────────────────────────────────────────
 
@@ -369,6 +451,15 @@ def _run_step(
                         break
         deco.runtime_step_cli(cli_args, retry_count, max_user_code_retries, None)
 
+    # If this step runs inside a conda environment, replace the Python entrypoint
+    # with the conda env\'s interpreter.  This is what runtime_step_cli does in
+    # the normal Metaflow runtime (after runtime_task_created sets self.interpreter),
+    # but Dagster bypasses the runtime hooks so we replicate the logic here.
+    conda_interp = _get_conda_interpreter(step_name)
+    if conda_interp:
+        cli_args.entrypoint[0] = conda_interp
+        cli_args.env["PYTHONNOUSERSITE"] = "1"
+
     cmd = cli_args.get_args()
     merged_env = dict(cli_args.env)
     if extra_env:
@@ -561,6 +652,7 @@ class DagsterCompiler:
             step_env=self.step_env,
             step_decorator_specs=step_decorator_specs,
             step_with_decorators=step_with_decorators,
+            step_conda_env_ids=self._build_step_conda_env_ids(),
             origin_run_id=self.origin_run_id,
         )
 
@@ -603,6 +695,36 @@ class DagsterCompiler:
                 step_withs.append(resources_spec)
             withs[node.name] = step_withs
         return specs, withs
+
+    def _build_step_conda_env_ids(self) -> "dict[str, str | None]":
+        """Return a mapping of step_name -> conda environment id_ (or None).
+
+        The id_ is the short SHA256 hash that Metaflow/Micromamba uses to identify
+        a solved conda environment.  It is computed deterministically from the step's
+        @conda decorator attributes (packages, python version, pinned libs, etc.).
+
+        This information is embedded in the generated file so that, at runtime,
+        _get_conda_interpreter() can locate the correct Python binary without having
+        to re-parse the flow or re-instantiate the environment object.
+
+        Returns an empty dict (all Nones) when the environment is not conda-based,
+        preventing any conda-specific logic from running for non-conda deployments.
+        """
+        result: dict[str, str | None] = {}
+        # Only applicable for conda-family environments
+        if not hasattr(self.environment, "get_environment"):
+            for node in self._topological_order():
+                result[node.name] = None
+            return result
+        for node in self._topological_order():
+            try:
+                env_info = self.environment.get_environment(node)
+                id_ = env_info.get("id_")
+                # Ensure the id_ is a plain string, not a mock object or other type.
+                result[node.name] = id_ if isinstance(id_, str) and id_ else None
+            except Exception:
+                result[node.name] = None
+        return result
 
     def _build_resources_spec(self, node) -> str | None:
         """Return a 'resources:cpu=N,memory=M,gpu=G' spec string from @resources, or None."""
