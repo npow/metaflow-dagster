@@ -37,6 +37,10 @@ jobs:
           metaflow-ref: npow/corral-devstack
           extra-install: ".[test]"
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          # Use a higher per-test timeout (600s) because dagster jobs run steps
+          # as subprocesses via the multiprocess executor and can be slow on
+          # shared CI runners, especially for flows with retries.
+          pytest-args: "-n 4 -v --tb=short --timeout=600 --cov-fail-under=0"
           ux-test-config: |
             backends:
               - name: dagster
