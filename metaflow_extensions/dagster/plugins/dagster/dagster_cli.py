@@ -102,7 +102,7 @@ def _resolve_job_name(name, flow_name, flow=None):
 
 def _validate_workflow(flow, graph):
     # Validate parameters have defaults
-    for var, param in flow._get_parameters():
+    for _var, param in flow._get_parameters():
         if "default" not in param.kwargs:
             raise MetaflowException(
                 f"Parameter *{param.name}* does not have a default value. "
