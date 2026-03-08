@@ -27,7 +27,13 @@ jobs:
         env:
           METAFLOW_DEFAULT_DATASTORE: local
           METAFLOW_DEFAULT_METADATA: local
+          METAFLOW_DATASTORE_SYSROOT_LOCAL: ${{ runner.temp }}/mf-ds
         run: |
+          # test_launch.py covers the full Dagster run-lifecycle path:
+          #   compile → execute_job(recon_job, instance=instance)
+          #   → run persisted in Dagster SQLite DB (SyncInMemoryRunLauncher, no daemon)
+          #   → Metaflow steps execute as subprocesses
+          #   → Metaflow artifacts appear in local datastore
           pytest -v -m e2e \
             --timeout=300 \
             --tb=short \
