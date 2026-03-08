@@ -38,6 +38,10 @@ jobs:
           metaflow-ref: npow/corral-devstack
           extra-install: ".[test]"
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          # Conda steps run inside Dagster subprocess workers which don't
+          # inherit the conda environment from the parent process, so @conda
+          # cannot bootstrap correctly. Disable conda tests for this backend.
+          conda: "false"
           # Use a higher per-test timeout (600s) because dagster jobs run steps
           # as subprocesses via the multiprocess executor and can be slow on
           # shared CI runners, especially for flows with retries.
