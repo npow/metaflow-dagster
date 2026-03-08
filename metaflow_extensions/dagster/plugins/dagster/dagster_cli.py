@@ -224,6 +224,23 @@ def create(obj, file, name=None, tags=None, user_namespace=None,
 
     flow_file = os.path.abspath(sys.argv[0])
 
+    step_env = _gather_step_env()
+    # Embed METAFLOW_FLOW_CONFIG_VALUE so step subprocesses have access to config
+    # overrides (--config-value / --config) at task runtime. This is required for
+    # config_expr / @project decorators to evaluate correctly in step subprocesses.
+    try:
+        from metaflow.flowspec import FlowStateItems
+        flow_configs = obj.flow._flow_state.get(FlowStateItems.CONFIGS, {})
+        config_env = {
+            name: value
+            for name, (value, _is_plain) in flow_configs.items()
+            if value is not None
+        }
+        if config_env:
+            step_env["METAFLOW_FLOW_CONFIG_VALUE"] = json.dumps(config_env)
+    except Exception:
+        pass
+
     compiler = DagsterCompiler(
         job_name=job_name,
         graph=obj.graph,
@@ -238,7 +255,7 @@ def create(obj, file, name=None, tags=None, user_namespace=None,
         with_decorators=list(with_decorators) if with_decorators else [],
         namespace=user_namespace,
         workflow_timeout=workflow_timeout,
-        step_env=_gather_step_env(),
+        step_env=step_env,
     )
 
     with open(file, "w") as f:
