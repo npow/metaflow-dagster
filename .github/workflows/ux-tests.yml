@@ -33,15 +33,19 @@ jobs:
       # and a SQLite-backed DagsterInstance.  This runs Metaflow steps as real
       # subprocesses via the multiprocess executor — no daemon or webserver needed.
 
+      # setup-miniconda@v3 adds /usr/share/miniconda/condabin to PATH but not
+      # the full conda/mamba bin directory.  Metaflow's @conda decorator resolves
+      # mamba/conda by searching PATH directly, so we must add the bin directory
+      # explicitly here.  Dagster subprocess workers inherit os.environ from the
+      # parent process (via _build_env()), so this PATH entry is visible to them.
+      - name: Add conda bin to PATH for subprocess access
+        run: echo "/usr/share/miniconda/bin" >> $GITHUB_PATH
+
       - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
         with:
           metaflow-ref: npow/corral-devstack
           extra-install: ".[test]"
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
-          # Conda steps run inside Dagster subprocess workers which don't
-          # inherit the conda environment from the parent process, so @conda
-          # cannot bootstrap correctly. Disable conda tests for this backend.
-          conda: "false"
           # Use a higher per-test timeout (600s) because dagster jobs run steps
           # as subprocesses via the multiprocess executor and can be slow on
           # shared CI runners, especially for flows with retries.
