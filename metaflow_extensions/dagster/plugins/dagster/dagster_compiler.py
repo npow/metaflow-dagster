@@ -469,23 +469,27 @@ def _run_step(
 
 
 def _get_foreach_splits(run_id: str, step_name: str, task_id: str) -> int:
-    """Read the foreach cardinality directly from the local datastore files.
+    """Read the foreach cardinality via the FlowDataStore API.
 
-    Reads <ds_root>/<flow>/<run>/<step>/<task>/0.data.json to find the SHA of
-    _foreach_num_splits, then decompresses the gzip+pickle blob.
-    Bypasses the Metaflow metadata service to avoid import-time caching issues.
+    Uses the proper datastore abstraction instead of manually navigating
+    the local file layout and deserializing pickle blobs.
     """
-    import gzip
-    import pickle
-    ds_root = _get_ds_root()
+    from metaflow.datastore import FlowDataStore
+    from metaflow.plugins import DATASTORES
+
+    ds_type = next(
+        (a.split("=", 1)[1] for a in METAFLOW_TOP_ARGS if a.startswith("--datastore=")),
+        next(
+            (a for i, a in enumerate(METAFLOW_TOP_ARGS) if i > 0 and METAFLOW_TOP_ARGS[i - 1] == "--datastore"),
+            "local",
+        ),
+    )
     try:
-        data_json_path = os.path.join(ds_root, FLOW_NAME, run_id, step_name, task_id, "0.data.json")
-        with open(data_json_path) as fh:
-            data_map = json.load(fh)
-        sha = data_map["objects"]["_foreach_num_splits"]
-        blob_path = os.path.join(ds_root, FLOW_NAME, "data", sha[:2], sha)
-        with gzip.open(blob_path, "rb") as fh:
-            return int(pickle.load(fh))
+        _impl = next(d for d in DATASTORES if d.TYPE == ds_type)
+        _root = _get_ds_root() or _impl.get_datastore_root_from_config(lambda *a: None)
+        _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+        _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode='r')
+        return int(_tds['_foreach_num_splits'])
     except Exception as exc:
         raise RuntimeError(
             f"Could not read foreach splits for {{step_name!r}}: {{exc}}"
@@ -493,22 +497,30 @@ def _get_foreach_splits(run_id: str, step_name: str, task_id: str) -> int:
 
 
 def _get_condition_branch(run_id: str, step_name: str, task_id: str) -> str:
-    """Read the condition branch taken from the local datastore files.
+    """Read the condition branch taken via the FlowDataStore API.
 
-    Reads the _transition artifact written by a split-switch step to determine
-    which branch was taken at runtime.
+    Uses the proper datastore abstraction instead of manually navigating
+    the local file layout and deserializing pickle blobs.
     """
-    import gzip
-    import pickle
-    ds_root = _get_ds_root()
+    from metaflow.datastore import FlowDataStore
+    from metaflow.plugins import DATASTORES
+
+    ds_type = next(
+        (a.split("=", 1)[1] for a in METAFLOW_TOP_ARGS if a.startswith("--datastore=")),
+        next(
+            (a for i, a in enumerate(METAFLOW_TOP_ARGS) if i > 0 and METAFLOW_TOP_ARGS[i - 1] == "--datastore"),
+            "local",
+        ),
+    )
     try:
-        data_json_path = os.path.join(ds_root, FLOW_NAME, run_id, step_name, task_id, "0.data.json")
-        with open(data_json_path) as fh:
-            data_map = json.load(fh)
-        sha = data_map["objects"]["_transition"]
-        blob_path = os.path.join(ds_root, FLOW_NAME, "data", sha[:2], sha)
-        with gzip.open(blob_path, "rb") as fh:
-            return str(pickle.load(fh))
+        _impl = next(d for d in DATASTORES if d.TYPE == ds_type)
+        _root = _get_ds_root() or _impl.get_datastore_root_from_config(lambda *a: None)
+        _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+        _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode='r')
+        _transition = _tds['_transition']
+        if isinstance(_transition, (list, tuple)) and _transition:
+            return str(_transition[0])
+        return str(_transition)
     except Exception as exc:
         raise RuntimeError(
             f"Could not read condition branch for {{step_name!r}}: {{exc}}"
