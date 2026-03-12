@@ -486,7 +486,7 @@ def _get_foreach_splits(run_id: str, step_name: str, task_id: str) -> int:
     )
     try:
         _impl = next(d for d in DATASTORES if d.TYPE == ds_type)
-        _root = _impl.get_datastore_root_from_config(lambda *a: None)
+        _root = _get_ds_root() or _impl.get_datastore_root_from_config(lambda *a: None)
         _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
         _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode='r')
         return int(_tds['_foreach_num_splits'])
@@ -514,7 +514,7 @@ def _get_condition_branch(run_id: str, step_name: str, task_id: str) -> str:
     )
     try:
         _impl = next(d for d in DATASTORES if d.TYPE == ds_type)
-        _root = _impl.get_datastore_root_from_config(lambda *a: None)
+        _root = _get_ds_root() or _impl.get_datastore_root_from_config(lambda *a: None)
         _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
         _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode='r')
         _transition = _tds['_transition']
