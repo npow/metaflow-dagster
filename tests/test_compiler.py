@@ -661,3 +661,40 @@ class TestCondaEnvIds:
         with patch.object(compiler.environment, "get_environment", side_effect=RuntimeError("oops")):
             ids = compiler._build_step_conda_env_ids()
         assert all(v is None for v in ids.values())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3-level nested foreach — regression for D-A02-4
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestNestedForeach3Level:
+    """3-level nested foreach exposes a KeyError in _generate_job_body when the
+    compiler tries to look up an inner foreach step name in the chains dict,
+    which is keyed only by outermost foreach names (D-A02-4)."""
+
+    def setup_method(self):
+        self.flow_cls = _import_flow("nested_foreach_3level_flow")
+
+    def test_compiles_without_error(self):
+        """Must not raise KeyError or any other exception during compilation."""
+        code = _compile(self.flow_cls)
+        assert _is_valid_python(code)
+
+    def test_top_level_ops_present(self):
+        # Inner steps (outer, middle, inner, inner_join, middle_join) are executed
+        # via _run_step() inside the compound body op, not as top-level Dagster ops.
+        code = _compile(self.flow_cls)
+        assert "def op_start(" in code
+        assert "def op_outer_join(" in code
+        assert "def op_end(" in code
+
+    def test_compound_body_executes_all_steps(self):
+        # The compound body must call _run_step for each inner step.
+        code = _compile(self.flow_cls)
+        for step in ("outer", "middle", "inner", "inner_join", "middle_join"):
+            assert f"'{step}'" in code, f"Step {step!r} not found in generated code"
+
+    def test_map_collect_in_job_body(self):
+        code = _compile(self.flow_cls)
+        assert ".map(" in code
+        assert ".collect()" in code

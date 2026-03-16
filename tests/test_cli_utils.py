@@ -314,3 +314,35 @@ class TestGatherStepEnv:
         ):
             result = _gather_step_env()
         assert result["METAFLOW_DATASTORE_SYSROOT_LOCAL"] == "/home/runner"
+
+    def test_excludes_service_auth_key(self):
+        """METAFLOW_SERVICE_AUTH_KEY must not be embedded in the generated file (D-A11-1)."""
+        mock_config = [
+            ("METAFLOW_DEFAULT_METADATA", "service"),
+            ("METAFLOW_SERVICE_URL", "https://metaflow.internal"),
+            ("METAFLOW_SERVICE_AUTH_KEY", "super-secret-token"),
+        ]
+        with patch(
+            "metaflow_extensions.dagster.plugins.dagster.dagster_cli.config_values",
+            return_value=mock_config,
+        ):
+            result = _gather_step_env()
+        assert "METAFLOW_SERVICE_AUTH_KEY" not in result, (
+            "_gather_step_env() must not capture METAFLOW_SERVICE_AUTH_KEY — "
+            "it would be embedded in the generated definitions file and committed to VCS"
+        )
+        assert "super-secret-token" not in result.values()
+        # Non-secret service keys should still pass through
+        assert result.get("METAFLOW_SERVICE_URL") == "https://metaflow.internal"
+
+    def test_excludes_internal_url(self):
+        """METAFLOW_SERVICE_INTERNAL_URL is also sensitive and must be excluded."""
+        mock_config = [
+            ("METAFLOW_SERVICE_INTERNAL_URL", "https://internal.metaflow.svc"),
+        ]
+        with patch(
+            "metaflow_extensions.dagster.plugins.dagster.dagster_cli.config_values",
+            return_value=mock_config,
+        ):
+            result = _gather_step_env()
+        assert "METAFLOW_SERVICE_INTERNAL_URL" not in result

@@ -22,6 +22,16 @@ class DagsterException(MetaflowException):
 
 VALID_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
+# Keys excluded from METAFLOW_STEP_ENV in the generated definitions file.
+# These are sensitive credentials that must be provided at Dagster runtime
+# via environment variables, not baked into a file that may be committed to VCS.
+_STEP_ENV_DENYLIST = frozenset(
+    {
+        "METAFLOW_SERVICE_AUTH_KEY",
+        "METAFLOW_SERVICE_INTERNAL_URL",
+    }
+)
+
 
 def _fix_local_step_metadata(flow_name, run_id):
     """Create missing step and task-level _self.json files for local metadata.
@@ -138,11 +148,17 @@ def _validate_workflow(flow, graph):
 
 
 def _gather_step_env():
-    """Gather Metaflow runtime config keys to embed in the generated file."""
+    """Gather Metaflow runtime config keys to embed in the generated file.
+
+    Keys in _STEP_ENV_DENYLIST are excluded: they are sensitive credentials
+    that must be provided at Dagster runtime via environment variables rather
+    than baked into a generated file that may be committed to VCS.
+    """
     return {
         k: v
         for k, v in config_values()
         if v is not None
+        and k not in _STEP_ENV_DENYLIST
         and k.startswith(
             (
                 "METAFLOW_DEFAULT_",

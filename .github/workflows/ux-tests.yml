@@ -53,6 +53,7 @@ jobs:
           # --dist=loadfile keeps tests from the same file on the same worker so
           # both @conda tests (in test_basic.py) run sequentially on one worker,
           # preventing micromamba repodata SOLV file races between parallel workers.
+          test-files: "test_basic.py test_config.py test_dag.py test_resume.py"
           pytest-args: "-n 4 --dist=loadfile -v --tb=short --timeout=600 --cov-fail-under=0"
           ux-test-config: |
             backends:

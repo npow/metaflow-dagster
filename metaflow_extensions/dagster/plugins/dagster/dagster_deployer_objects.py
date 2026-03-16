@@ -198,5 +198,56 @@ class DagsterDeployedFlow(DeployedFlow):
             f"Error triggering Dagster job for flow {self.deployer.flow_file!r}"
         )
 
+    def resume(self, origin_run_id: str, **kwargs) -> DagsterTriggeredRun:
+        """Resume a failed run from *origin_run_id*.
+
+        Parameters
+        ----------
+        origin_run_id : str
+            Metaflow run ID of the run to resume (e.g. ``"dagster-abc123def456"``).
+        **kwargs : Any
+            Additional keyword arguments forwarded to the ``dagster resume`` CLI.
+
+        Returns
+        -------
+        DagsterTriggeredRun
+        """
+        additional_info = getattr(self.deployer, "additional_info", {}) or {}
+        definitions_file = additional_info.get("definitions_file")
+
+        with temporary_fifo() as (attribute_file_path, attribute_file_fd):
+            resume_kwargs = {
+                "run_id": origin_run_id,
+                "deployer_attribute_file": attribute_file_path,
+            }
+            if definitions_file:
+                resume_kwargs["definitions_file"] = definitions_file
+
+            command = get_lower_level_group(
+                self.deployer.api,
+                self.deployer.top_level_kwargs,
+                self.deployer.TYPE,
+                self.deployer.deployer_kwargs,
+            ).resume(**resume_kwargs)
+
+            pid = self.deployer.spm.run_command(
+                [sys.executable, *command],
+                env=self.deployer.env_vars,
+                cwd=self.deployer.cwd,
+                show_output=self.deployer.show_output,
+            )
+
+            command_obj = self.deployer.spm.get(pid)
+            content = handle_timeout(
+                attribute_file_fd, command_obj, self.deployer.file_read_timeout
+            )
+            command_obj.sync_wait()
+            if command_obj.process.returncode == 0:
+                return DagsterTriggeredRun(deployer=self.deployer, content=content)
+
+        raise RuntimeError(
+            f"Error resuming Dagster job for flow {self.deployer.flow_file!r}"
+        )
+
     # Keep trigger() as an alias for backwards compatibility.
     trigger = run
