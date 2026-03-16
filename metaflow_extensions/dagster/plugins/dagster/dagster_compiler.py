@@ -804,17 +804,40 @@ class DagsterCompiler:
 
     def _topological_order(self):
         if self._topo_cache is None:
-            visited = set()
-            queue = deque([self.graph["start"]])
+            # Collect all reachable nodes first
+            all_nodes: dict = {}
+            stack = [self.graph["start"]]
+            while stack:
+                node = stack.pop()
+                if node.name in all_nodes:
+                    continue
+                all_nodes[node.name] = node
+                for child_name in node.out_funcs:
+                    stack.append(self.graph[child_name])
+
+            # Kahn's algorithm: emit a node only after all predecessors are done.
+            # Plain BFS fails for flows where one join is reachable via both a short
+            # path (e.g. branch_b → outer_join) and a longer one (inner_join →
+            # outer_join), because BFS marks outer_join visited before inner_join
+            # is processed, producing an undefined-variable reference in the job body.
+            in_degree: dict = {name: 0 for name in all_nodes}
+            for node in all_nodes.values():
+                for child_name in node.out_funcs:
+                    if child_name in in_degree:
+                        in_degree[child_name] += 1
+
+            queue = deque(
+                [all_nodes[name] for name, deg in in_degree.items() if deg == 0]
+            )
             result = []
             while queue:
                 node = queue.popleft()
-                if node.name in visited:
-                    continue
-                visited.add(node.name)
                 result.append(node)
-                for child in node.out_funcs:
-                    queue.append(self.graph[child])
+                for child_name in node.out_funcs:
+                    if child_name in in_degree:
+                        in_degree[child_name] -= 1
+                        if in_degree[child_name] == 0:
+                            queue.append(all_nodes[child_name])
             self._topo_cache = result
         return self._topo_cache
 
@@ -1091,7 +1114,10 @@ class DagsterCompiler:
         env_code = self._extra_env_code(node)
         max_retries, _ = self._get_retry_info(node)
         deco = self._op_decorator_str(node, ins_spec=ins_spec, out_spec=out_spec)
-        yields = "\n    ".join(
+        # Use 16-space separator to match the {yields} indent in the template below.
+        # A 4-space separator would make the second yield the minimum-indent line,
+        # causing dedent() to only strip 4 spaces and leaving @op at 8 spaces.
+        yields = "\n                ".join(
             f'yield Output(task_path, output_name="{b}")' for b in branches
         )
         return dedent(f"""\
@@ -1451,6 +1477,10 @@ class DagsterCompiler:
         """
         lines: list[str] = []
         var_map: dict[str, str] = {}
+        # Tracks variable names that hold DynamicMappedValues (produced by .map()).
+        # A linear step whose parent's var is in dynamic_vars must chain with .map()
+        # rather than call the op directly (multi-body foreach pattern).
+        dynamic_vars: set[str] = set()
 
         chains = self._foreach_chains()
         steps_in_compound = self._steps_in_compound()
@@ -1494,12 +1524,19 @@ class DagsterCompiler:
                 if foreach_parent is not None:
                     dyn_var = var_map[foreach_parent]
                     lines.append(f"{var} = {dyn_var}.map({op_call})")
+                    dynamic_vars.add(var)
                 elif self._is_condition_merge(node):
                     kwargs = ", ".join(f"{p}={var_map.get(p, p)}" for p in node.in_funcs)
                     lines.append(f"{var} = {op_call}({kwargs})")
                 else:
                     pvar = self._resolve_input(node, var_map)
-                    lines.append(f"{var} = {op_call}({pvar})")
+                    if pvar in dynamic_vars:
+                        # Multi-body foreach interior step: chain with .map() instead
+                        # of passing the DynamicMappedValue directly (which Dagster rejects).
+                        lines.append(f"{var} = {pvar}.map({op_call})")
+                        dynamic_vars.add(var)
+                    else:
+                        lines.append(f"{var} = {op_call}({pvar})")
                 var_map[node.name] = var
 
             # ── split step ────────────────────────────────────────────────────
