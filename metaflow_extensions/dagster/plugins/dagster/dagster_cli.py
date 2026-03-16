@@ -442,6 +442,9 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
     # Write the deployer_attribute_file BEFORE checking success so that
     # DagsterDeployedFlow.run() can construct a DagsterTriggeredRun even when
     # the job failed — letting the caller detect failure via triggered_run.status.
+    # The dagster_job_succeeded flag lets DagsterTriggeredRun.status immediately
+    # return "FAILED" without waiting for Metaflow run registration (which may
+    # never complete when a step crashes before writing its metadata).
     if deployer_attribute_file:
         pathspec = f"{obj.flow.name}/{run_id}"
         with open(deployer_attribute_file, "w") as f:
@@ -449,6 +452,7 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
                 {
                     "pathspec": pathspec,
                     "job_name": resolved_job_name,
+                    "dagster_job_succeeded": result.success,
                     "metadata": {"flow_name": obj.flow.name},
                 },
                 f,

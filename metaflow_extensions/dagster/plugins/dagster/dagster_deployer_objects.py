@@ -38,6 +38,19 @@ class DagsterTriggeredRun(TriggeredRun):
     Metaflow until the run with ``pathspec`` (``FlowName/dagster-<run_id>``) appears.
     """
 
+    def __init__(self, deployer, content: str):
+        super().__init__(deployer=deployer, content=content)
+        # Parse the dagster_job_succeeded flag embedded by the trigger command.
+        # True = Dagster job completed successfully.
+        # False = Dagster job failed (a step raised an exception).
+        # None = field absent (legacy content without this flag).
+        try:
+            self._dagster_job_succeeded = json.loads(content or "{}").get(
+                "dagster_job_succeeded", None
+            )
+        except Exception:
+            self._dagster_job_succeeded = None
+
     @property
     def dagster_ui(self) -> str | None:
         """URL to the Dagster UI for this run, if available.
@@ -78,7 +91,15 @@ class DagsterTriggeredRun(TriggeredRun):
 
     @property
     def status(self) -> str | None:
-        """Return a simple status string based on the underlying Metaflow run."""
+        """Return a simple status string.
+
+        When dagster_job_succeeded is False the Dagster job itself failed
+        (a step raised an exception), so we return FAILED immediately without
+        waiting for the Metaflow run to appear in metadata — the run may never
+        register as finished if the flow crashed before reaching the end step.
+        """
+        if self._dagster_job_succeeded is False:
+            return "FAILED"
         run = self.run
         if run is None:
             return "PENDING"
