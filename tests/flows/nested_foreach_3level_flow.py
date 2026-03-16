@@ -54,4 +54,4 @@ class NestedForeach3levelFlow(FlowSpec):
 
 
 if __name__ == "__main__":
-    NestedForeach3LevelFlow()
+    NestedForeach3levelFlow()

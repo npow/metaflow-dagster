@@ -249,8 +249,10 @@ def _run_init(
         + METAFLOW_TOP_ARGS
         + ["init", "--run-id", run_id, "--task-id", params_task_id]
     )
-    if ORIGIN_RUN_ID:
-        cmd += ["--clone-run-id", ORIGIN_RUN_ID]
+    # Note: --clone-run-id is intentionally NOT passed to init.
+    # The _parameters task must always be freshly created for the new run;
+    # only _run_step passes --clone-run-id so individual steps can reuse
+    # outputs from the origin run.
     extra = {{
         "METAFLOW_INIT_" + k.upper().replace("-", "_"): str(v)
         for k, v in (parameters or {{}}).items()

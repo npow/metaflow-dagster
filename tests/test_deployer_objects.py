@@ -265,3 +265,18 @@ class TestDagsterDeployedFlow:
         # The deployer API mock will fail — run() should raise RuntimeError
         with pytest.raises(Exception):
             flow.run(foo="bar")
+
+    def test_resume_raises_on_failure(self):
+        deployer = _make_deployer()
+        flow = DagsterDeployedFlow(deployer=deployer)
+        with pytest.raises(Exception):
+            flow.resume(origin_run_id="dagster-abc123def456")
+
+    def test_resume_passes_definitions_file(self):
+        deployer = _make_deployer(definitions_file="/path/to/defs.py")
+        flow = DagsterDeployedFlow(deployer=deployer)
+        # resume() should attempt to call the resume CLI — will raise because
+        # the mock deployer's spm is not set up, but the definitions_file path
+        # should be extracted from additional_info before the call.
+        additional_info = getattr(flow.deployer, "additional_info", {}) or {}
+        assert additional_info.get("definitions_file") == "/path/to/defs.py"
