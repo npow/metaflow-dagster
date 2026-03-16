@@ -266,6 +266,39 @@ class TestDagsterDeployedFlow:
         with pytest.raises(Exception):
             flow.run(foo="bar")
 
+    def test_run_returns_triggered_run_when_content_written_despite_failure(self):
+        """run() must return DagsterTriggeredRun when content was written even
+        if the subprocess exits non-zero (Dagster job failed mid-execution).
+        Enables test_fail_flow_reports_failed_status via wait_for_deployed_run_allow_failure.
+        """
+        import json as _json
+        from unittest.mock import MagicMock, patch
+
+        deployer = _make_deployer()
+        flow = DagsterDeployedFlow(deployer=deployer)
+
+        fake_content = _json.dumps({"pathspec": "FailFlow/dagster-abc123def456"})
+        mock_command_obj = MagicMock()
+        mock_command_obj.process.returncode = 1  # non-zero exit
+
+        with patch(
+            "metaflow_extensions.dagster.plugins.dagster.dagster_deployer_objects.handle_timeout",
+            return_value=fake_content,
+        ), patch(
+            "metaflow_extensions.dagster.plugins.dagster.dagster_deployer_objects.temporary_fifo"
+        ) as mock_fifo, patch(
+            "metaflow_extensions.dagster.plugins.dagster.dagster_deployer_objects.get_lower_level_group"
+        ):
+            mock_fifo.return_value.__enter__ = MagicMock(return_value=("/tmp/fifo", 3))
+            mock_fifo.return_value.__exit__ = MagicMock(return_value=False)
+            deployer.spm.run_command.return_value = 99
+            deployer.spm.get.return_value = mock_command_obj
+
+            result = flow.run()
+
+        assert isinstance(result, DagsterTriggeredRun)
+        assert result.pathspec == "FailFlow/dagster-abc123def456"
+
     def test_resume_raises_on_failure(self):
         deployer = _make_deployer()
         flow = DagsterDeployedFlow(deployer=deployer)

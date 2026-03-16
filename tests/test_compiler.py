@@ -667,6 +667,53 @@ class TestCondaEnvIds:
 # 3-level nested foreach — regression for D-A02-4
 # ──────────────────────────────────────────────────────────────────────────────
 
+class TestMultibodyForeachFlow:
+    """Multi-body foreach: single-level foreach with multiple linear body steps.
+
+    Regression for DagsterInvalidDefinitionError (chained .map() had wrong
+    semantics) and [7,7,7] incorrect results.  The compiler must generate a
+    compound op that runs all body steps sequentially per foreach item.
+    """
+
+    def setup_method(self):
+        self.flow_cls = _import_flow("multibody_foreach_flow")
+        self.compiler = _make_compiler(self.flow_cls)
+        self.code = _compile(self.flow_cls)
+
+    def test_syntax_valid(self):
+        assert _is_valid_python(self.code)
+
+    def test_body_steps_in_compound(self):
+        compound = self.compiler._steps_in_compound()
+        assert "process" in compound
+        assert "transform" in compound
+
+    def test_compound_op_generated(self):
+        assert "op_start__body" in self.code
+
+    def test_map_collect_in_job_body(self):
+        assert ".map(op_start__body)" in self.code
+        assert ".collect()" in self.code
+
+    def test_no_separate_process_op(self):
+        # process and transform must be inside compound body, not top-level ops
+        assert "def op_process(" not in self.code
+        assert "def op_transform(" not in self.code
+
+    def test_compound_body_runs_both_steps(self):
+        assert "'process'" in self.code
+        assert "'transform'" in self.code
+
+    def test_split_index_passed_to_first_body_step(self):
+        # The first body step needs split_index so Metaflow sets self.input correctly
+        assert "split_index=_split_index" in self.code
+
+    def test_foreach_body_interior_steps(self):
+        graph = self.compiler.graph
+        interior = self.compiler._foreach_body_interior_steps("process", "join")
+        assert interior == ["process", "transform"]
+
+
 class TestNestedForeach3Level:
     """3-level nested foreach exposes a KeyError in _generate_job_body when the
     compiler tries to look up an inner foreach step name in the chains dict,
