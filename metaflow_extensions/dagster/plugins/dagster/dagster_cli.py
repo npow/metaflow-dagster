@@ -423,20 +423,6 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
                 run_config=run_config,
             )
 
-        if not result.success:
-            # Collect failure messages for a helpful error
-            failure_msgs = []
-            for event in result.all_events:
-                if event.is_failure:
-                    esd = getattr(event, "event_specific_data", None)
-                    err = getattr(esd, "error", None)
-                    if err:
-                        failure_msgs.append(str(err.message))
-            detail = "; ".join(failure_msgs) if failure_msgs else "(no details)"
-            raise DagsterException(
-                f"Dagster job {resolved_job_name!r} failed. {detail}"
-            )
-
         dagster_run_id = result.run_id
     finally:
         if old_dagster_home is None:
@@ -453,6 +439,9 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
     # can enumerate steps and determine run completion.
     _fix_local_step_metadata(obj.flow.name, run_id)
 
+    # Write the deployer_attribute_file BEFORE checking success so that
+    # DagsterDeployedFlow.run() can construct a DagsterTriggeredRun even when
+    # the job failed — letting the caller detect failure via triggered_run.status.
     if deployer_attribute_file:
         pathspec = f"{obj.flow.name}/{run_id}"
         with open(deployer_attribute_file, "w") as f:
@@ -464,6 +453,20 @@ def trigger(obj, definitions_file, job_name=None, run_params=None, deployer_attr
                 },
                 f,
             )
+
+    if not result.success:
+        # Collect failure messages for a helpful error
+        failure_msgs = []
+        for event in result.all_events:
+            if event.is_failure:
+                esd = getattr(event, "event_specific_data", None)
+                err = getattr(esd, "error", None)
+                if err:
+                    failure_msgs.append(str(err.message))
+        detail = "; ".join(failure_msgs) if failure_msgs else "(no details)"
+        raise DagsterException(
+            f"Dagster job {resolved_job_name!r} failed. {detail}"
+        )
 
     obj.echo(
         f"Dagster job *{resolved_job_name}* executed from *{definitions_file}*.",

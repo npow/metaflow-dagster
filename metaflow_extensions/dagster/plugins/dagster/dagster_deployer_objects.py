@@ -191,7 +191,10 @@ class DagsterDeployedFlow(DeployedFlow):
                 attribute_file_fd, command_obj, self.deployer.file_read_timeout
             )
             command_obj.sync_wait()
-            if command_obj.process.returncode == 0:
+            # Return a DagsterTriggeredRun if a pathspec was written, even when
+            # the trigger subprocess exits non-zero (Dagster job failed). The
+            # caller can detect job failure via triggered_run.status == "FAILED".
+            if content:
                 return DagsterTriggeredRun(deployer=self.deployer, content=content)
 
         raise RuntimeError(

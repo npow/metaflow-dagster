@@ -640,10 +640,15 @@ class DagsterCompiler:
         for node in self._topological_order():
             if node.name not in steps_in_compound:
                 parts.append(self._render_op(node))
-        # Emit compound ops for any nested foreach chains
-        for chain in chains.values():
+        # Emit compound ops for nested foreach chains and multi-body foreach
+        for outer_name, chain in chains.items():
             if len(chain) > 1:
                 parts.append(self._render_nested_foreach_compound_op(chain))
+            else:
+                _, body_name, join_name = chain[0]
+                interior = self._foreach_body_interior_steps(body_name, join_name)
+                if len(interior) > 1:
+                    parts.append(self._render_multibody_foreach_compound_op(outer_name, interior))
         parts.append(self._render_job())
         if self.schedule:
             parts.append(self._render_schedule())
@@ -786,20 +791,48 @@ class DagsterCompiler:
 
     # ── Op rendering ───────────────────────────────────────────────────────────
 
+    def _foreach_body_interior_steps(self, body_name: str, join_name: str) -> list:
+        """Return the ordered list of linear steps from body_name up to (not incl.) join_name.
+
+        For a simple foreach with one body step, returns [body_name].
+        For a multi-body foreach (e.g. process → transform → join), returns
+        [process, transform].  Stops at any non-single-out step (branching).
+        """
+        steps = []
+        current = body_name
+        while True:
+            node = self.graph[current]
+            if len(node.out_funcs) != 1:
+                break
+            steps.append(current)
+            next_name = node.out_funcs[0]
+            if next_name == join_name:
+                break
+            current = next_name
+        return steps
+
     def _steps_in_compound(self) -> set:
         """Return step names that are handled inside compound ops.
 
         Steps in this set must NOT be emitted as standalone @op definitions,
         nor visited in the top-level job body — they are fully contained
-        inside the compound op generated for each nested foreach chain.
+        inside the compound op generated for each nested foreach chain or
+        multi-body foreach.
         """
         result = set()
-        for chain in self._foreach_chains().values():
+        for _outer_name, chain in self._foreach_chains().items():
             if len(chain) > 1:
                 result.add(chain[0][1])  # outer_body (itself a foreach step)
                 for _, body_n, join_n in chain[1:]:
                     result.add(body_n)
                     result.add(join_n)
+            else:
+                # Single-level: check for multi-body foreach
+                _, body_name, join_name = chain[0]
+                interior = self._foreach_body_interior_steps(body_name, join_name)
+                if len(interior) > 1:
+                    for s in interior:
+                        result.add(s)
         return result
 
     def _topological_order(self):
@@ -1455,6 +1488,49 @@ class DagsterCompiler:
         result_lines.append(f"return {final_var}")
         return result_lines
 
+    def _render_multibody_foreach_compound_op(self, foreach_name: str, interior: list) -> str:
+        """Compound op for single-level multi-body foreach (foreach → step1 → step2 → ... → join).
+
+        Receives the foreach DynamicOutput path (containing //_i=N), runs all
+        body steps sequentially with per-item task IDs (matching what Metaflow
+        expects for foreach body tasks), and returns the last body step's path
+        for the join op to collect.
+        """
+        compound_name = self._compound_op_name(foreach_name)
+        in_name = foreach_name
+        ins_spec = self._ins_spec(in_name)
+        tags_code = repr(self.tags)
+
+        lines = []
+        lines.append(f"    # {in_name} contains the foreach DynamicOutput path: run_id/step/tid//_i=N")
+        lines.append(f"    _parts = {in_name}.split('//_i=')")
+        lines.append("    _base_path, _split_index = _parts[0], int(_parts[1]) if len(_parts) > 1 else 0")
+        lines.append("    run_id = _base_path.split('/')[0]")
+        lines.append("    task_id = f'1-{_split_index}'")
+
+        for i, step_name in enumerate(interior):
+            node = self.graph[step_name]
+            max_retries, _ = self._get_retry_info(node)
+            env_code = self._extra_env_code(node)
+            prev_path = "_base_path" if i == 0 else f"_path_{interior[i - 1]}"
+            split_arg = ",\n        split_index=_split_index" if i == 0 else ""
+            lines.append(
+                f"    _path_{step_name} = _run_step(\n"
+                f"        context, {step_name!r}, run_id, {prev_path}, task_id,\n"
+                f"        retry_count=context.retry_number, max_user_code_retries={max_retries},\n"
+                f"        tags={tags_code}, extra_env={env_code}{split_arg})"
+            )
+            lines.append(f"    _add_step_metadata(context, _path_{step_name})")
+
+        last_path = f"_path_{interior[-1]}"
+        body = "\n".join(lines)
+        return (
+            f"@op(ins={ins_spec}, out=Out(str))\n"
+            f"def {compound_name}(context: OpExecutionContext, {in_name}: str) -> str:\n"
+            f"{body}\n"
+            f"    return {last_path}\n"
+        )
+
     # ── Job body ───────────────────────────────────────────────────────────────
 
     def _render_job(self) -> str:
@@ -1477,10 +1553,6 @@ class DagsterCompiler:
         """
         lines: list[str] = []
         var_map: dict[str, str] = {}
-        # Tracks variable names that hold DynamicMappedValues (produced by .map()).
-        # A linear step whose parent's var is in dynamic_vars must chain with .map()
-        # rather than call the op directly (multi-body foreach pattern).
-        dynamic_vars: set[str] = set()
 
         chains = self._foreach_chains()
         steps_in_compound = self._steps_in_compound()
@@ -1501,12 +1573,24 @@ class DagsterCompiler:
                 if ntype in ("split", "split-switch"):
                     for branch in node.out_funcs:
                         var_map[f"_branch_{branch}"] = f"{var}.{branch}"
-                elif ntype == "foreach" and "start" in chains and len(chains["start"]) > 1:
-                    compound_name = self._compound_op_name("start")
-                    compound_var = "r_start__body"
-                    lines.append(f"{compound_var} = {var}.map({compound_name})")
-                    outer_body_name = chains["start"][0][1]
-                    var_map[outer_body_name] = compound_var
+                elif ntype == "foreach" and "start" in chains:
+                    chain = chains["start"]
+                    if len(chain) > 1:
+                        # Nested foreach
+                        compound_name = self._compound_op_name("start")
+                        compound_var = "r_start__body"
+                        lines.append(f"{compound_var} = {var}.map({compound_name})")
+                        outer_body_name = chain[0][1]
+                        var_map[outer_body_name] = compound_var
+                    else:
+                        # Single-level: check for multi-body foreach
+                        _, body_name, join_name = chain[0]
+                        interior = self._foreach_body_interior_steps(body_name, join_name)
+                        if len(interior) > 1:
+                            compound_name = self._compound_op_name("start")
+                            compound_var = "r_start__body"
+                            lines.append(f"{compound_var} = {var}.map({compound_name})")
+                            var_map[body_name] = compound_var
 
             # ── end step ──────────────────────────────────────────────────────
             elif ntype == "end":
@@ -1524,19 +1608,12 @@ class DagsterCompiler:
                 if foreach_parent is not None:
                     dyn_var = var_map[foreach_parent]
                     lines.append(f"{var} = {dyn_var}.map({op_call})")
-                    dynamic_vars.add(var)
                 elif self._is_condition_merge(node):
                     kwargs = ", ".join(f"{p}={var_map.get(p, p)}" for p in node.in_funcs)
                     lines.append(f"{var} = {op_call}({kwargs})")
                 else:
                     pvar = self._resolve_input(node, var_map)
-                    if pvar in dynamic_vars:
-                        # Multi-body foreach interior step: chain with .map() instead
-                        # of passing the DynamicMappedValue directly (which Dagster rejects).
-                        lines.append(f"{var} = {pvar}.map({op_call})")
-                        dynamic_vars.add(var)
-                    else:
-                        lines.append(f"{var} = {op_call}({pvar})")
+                    lines.append(f"{var} = {op_call}({pvar})")
                 var_map[node.name] = var
 
             # ── split step ────────────────────────────────────────────────────
@@ -1563,12 +1640,24 @@ class DagsterCompiler:
                 var = f"r_{node.name}"
                 lines.append(f"{var} = {op_call}({pvar})")
                 var_map[node.name] = var
-                if node.name in chains and len(chains[node.name]) > 1:
-                    compound_name = self._compound_op_name(node.name)
-                    compound_var = f"r_{node.name}__body"
-                    lines.append(f"{compound_var} = {var}.map({compound_name})")
-                    outer_body_name = chains[node.name][0][1]
-                    var_map[outer_body_name] = compound_var
+                if node.name in chains:
+                    chain = chains[node.name]
+                    if len(chain) > 1:
+                        # Nested foreach
+                        compound_name = self._compound_op_name(node.name)
+                        compound_var = f"r_{node.name}__body"
+                        lines.append(f"{compound_var} = {var}.map({compound_name})")
+                        outer_body_name = chain[0][1]
+                        var_map[outer_body_name] = compound_var
+                    else:
+                        # Single-level: check for multi-body foreach
+                        _, body_name, join_name = chain[0]
+                        interior = self._foreach_body_interior_steps(body_name, join_name)
+                        if len(interior) > 1:
+                            compound_name = self._compound_op_name(node.name)
+                            compound_var = f"r_{node.name}__body"
+                            lines.append(f"{compound_var} = {var}.map({compound_name})")
+                            var_map[body_name] = compound_var
 
             # ── join step ─────────────────────────────────────────────────────
             elif ntype == "join":
