@@ -820,7 +820,7 @@ class DagsterCompiler:
             # path (e.g. branch_b → outer_join) and a longer one (inner_join →
             # outer_join), because BFS marks outer_join visited before inner_join
             # is processed, producing an undefined-variable reference in the job body.
-            in_degree: dict = {name: 0 for name in all_nodes}
+            in_degree: dict = dict.fromkeys(all_nodes, 0)
             for node in all_nodes.values():
                 for child_name in node.out_funcs:
                     if child_name in in_degree:
