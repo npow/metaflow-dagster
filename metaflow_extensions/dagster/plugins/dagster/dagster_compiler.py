@@ -41,7 +41,6 @@ Source : {flow_file}
 DO NOT EDIT — re-generate with:
     python {flow_basename} dagster create {output_file}
 """
-import atexit
 import hashlib
 import json
 import os
@@ -69,7 +68,6 @@ from dagster import (
     op,
     sensor,
 )
-from metaflow.decorators import extract_step_decorator_from_decospec
 from metaflow.util import compress_list
 
 # ── Flow constants ─────────────────────────────────────────────────────────────
@@ -86,8 +84,10 @@ METAFLOW_TOP_ARGS: List[str] = {top_args!r}
 # Metaflow env-vars forwarded to every subprocess
 METAFLOW_STEP_ENV: Dict[str, str] = {step_env!r}
 
-# Per-step runtime decorator specs and retry limits used to honor runtime_step_cli hooks.
-STEP_DECORATOR_SPECS: Dict[str, List[str]] = {step_decorator_specs!r}
+# Per-step --with decorator specs passed to the Metaflow CLI subprocess.
+# Decorators handled natively by Dagster (retry, timeout, environment, etc.)
+# are excluded — only compute/environment decorators (conda, kubernetes,
+# sandbox, etc.) are forwarded so Metaflow manages its own decorator lifecycle.
 STEP_WITH_DECORATORS: Dict[str, List[str]] = {step_with_decorators!r}
 
 # Per-step conda environment IDs, embedded at compile time.
@@ -269,92 +269,6 @@ def _get_ds_root() -> str:
     )
 
 
-# Code package cache — built once per process when @sandbox (or similar) is present.
-# The tarball is kept on disk until process exit so TarballStager can deliver it.
-_CODE_PACKAGE_CACHE: Dict[str, Optional[str]] = {{
-    "metadata": None, "sha": None, "url": None, "local_path": None,
-}}
-
-
-def _ensure_code_package():
-    """Build and upload the flow code package, caching the result process-wide."""
-    if _CODE_PACKAGE_CACHE["metadata"] is not None:
-        return (
-            _CODE_PACKAGE_CACHE["metadata"],
-            _CODE_PACKAGE_CACHE["sha"],
-            _CODE_PACKAGE_CACHE["url"],
-            _CODE_PACKAGE_CACHE["local_path"],
-        )
-
-    import re
-    import tempfile
-    from metaflow.datastore import FlowDataStore
-    from metaflow.plugins import DATASTORES
-
-    with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
-        package_path = tmp.name
-    try:
-        package_cmd = (
-            [sys.executable, FLOW_FILE]
-            + [a for a in METAFLOW_TOP_ARGS if a != "--quiet"]
-            + ["package", "save", package_path]
-        )
-        _pkg_proc = subprocess.Popen(
-            package_cmd,
-            env=_build_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=os.path.dirname(FLOW_FILE) or ".",
-        )
-        _pkg_stdout, _pkg_stderr = _communicate(_pkg_proc)
-        if _pkg_proc.returncode != 0:
-            raise RuntimeError(
-                "Failed to build Metaflow code package:\\n"
-                + (_pkg_stderr or _pkg_stdout)[-2000:]
-            )
-        meta_src = (_pkg_stdout or "") + "\\n" + (_pkg_stderr or "")
-        m = re.search(r"metadata:\\s*(\\{{.*\\}})", meta_src)
-        package_metadata = (
-            m.group(1).strip()
-            if m
-            else '{{"version": 0, "archive_format": "tgz", "mfcontent_version": 1}}'
-        )
-
-        with open(package_path, "rb") as f:
-            blob = f.read()
-
-        datastore_type = next(
-            (a.split("--datastore=", 1)[1] for a in METAFLOW_TOP_ARGS if a.startswith("--datastore=")),
-            None,
-        )
-        storage_impl = next(ds for ds in DATASTORES if ds.TYPE == datastore_type)
-        flow_datastore = FlowDataStore(
-            FLOW_NAME,
-            storage_impl=storage_impl,
-            ds_root=_get_ds_root() or None,
-        )
-        package_url, package_sha = flow_datastore.save_data([blob], len_hint=1)[0]
-        _CODE_PACKAGE_CACHE["metadata"] = package_metadata
-        _CODE_PACKAGE_CACHE["sha"] = package_sha
-        _CODE_PACKAGE_CACHE["url"] = package_url
-        _CODE_PACKAGE_CACHE["local_path"] = package_path
-        atexit.register(lambda p=package_path: os.path.exists(p) and os.unlink(p))
-    except Exception:
-        try:
-            os.unlink(package_path)
-        except Exception:
-            pass
-        raise
-
-    return (
-        _CODE_PACKAGE_CACHE["metadata"],
-        _CODE_PACKAGE_CACHE["sha"],
-        _CODE_PACKAGE_CACHE["url"],
-        _CODE_PACKAGE_CACHE["local_path"],
-    )
-
-
 def _run_step(
     context: OpExecutionContext,
     step_name: str,
@@ -427,36 +341,8 @@ def _run_step(
 
     cli_args = _CLIArgs()
 
-    for spec in STEP_DECORATOR_SPECS.get(step_name, []):
-        deco, _ = extract_step_decorator_from_decospec(spec)
-        # Set instance attributes that step_init would normally provide.
-        # runtime_step_cli (e.g. SandboxDecorator) accesses _step_name for dep staging.
-        if not hasattr(deco, "_step_name"):
-            deco._step_name = step_name
-        if (
-            hasattr(deco, "package_metadata")
-            and deco.package_metadata is None
-            and hasattr(deco, "package_sha")
-            and hasattr(deco, "package_url")
-        ):
-            package_metadata, package_sha, package_url, package_local_path = _ensure_code_package()
-            deco.package_metadata = package_metadata
-            deco.package_sha = package_sha
-            deco.package_url = package_url
-            # Propagate to the defining class so TarballStager delivery works for @sandbox.
-            # Traverse MRO to find the class that declares package_local_path (e.g.
-            # SandboxDecorator), not a subclass that merely inherits it.
-            if package_local_path:
-                for _cls in type(deco).__mro__:
-                    if "package_local_path" in _cls.__dict__:
-                        _cls.package_local_path = package_local_path
-                        break
-        deco.runtime_step_cli(cli_args, retry_count, max_user_code_retries, None)
-
     # If this step runs inside a conda environment, replace the Python entrypoint
-    # with the conda env\'s interpreter.  This is what runtime_step_cli does in
-    # the normal Metaflow runtime (after runtime_task_created sets self.interpreter),
-    # but Dagster bypasses the runtime hooks so we replicate the logic here.
+    # with the conda env\'s interpreter.
     conda_interp = _get_conda_interpreter(step_name)
     if conda_interp:
         cli_args.entrypoint[0] = conda_interp
@@ -660,7 +546,6 @@ class DagsterCompiler:
     # ── Preamble ───────────────────────────────────────────────────────────────
 
     def _render_preamble(self) -> str:
-        step_decorator_specs, step_with_decorators = self._build_step_decorator_info()
         return _PREAMBLE.format(
             flow_name=self.flow_name,
             job_name=self.job_name,
@@ -669,8 +554,7 @@ class DagsterCompiler:
             output_file="<output.py>",
             top_args=self._build_top_args(),
             step_env=self.step_env,
-            step_decorator_specs=step_decorator_specs,
-            step_with_decorators=step_with_decorators,
+            step_with_decorators=self._build_step_decorator_info(),
             step_conda_env_ids=self._build_step_conda_env_ids(),
             origin_run_id=self.origin_run_id,
         )
@@ -694,26 +578,43 @@ class DagsterCompiler:
             args.append(f"--namespace={self.namespace}")
         return args
 
-    def _build_step_decorator_info(self) -> "tuple[dict[str, list[str]], dict[str, list[str]]]":
-        """Return (decorator_specs, with_decorators) dicts in a single pass over the graph.
+    # Decorators handled natively by Dagster (retry policy, timeouts, env vars)
+    # or not relevant at step-subprocess runtime (project, triggers, schedule, card).
+    # These are excluded from --with flags; only compute/environment decorators
+    # (conda, kubernetes, sandbox, etc.) are forwarded to the Metaflow CLI subprocess
+    # so Metaflow manages its own decorator lifecycle.
+    _SKIP_WITH_DECORATORS = {
+        "retry", "timeout", "environment", "resources",
+        "project", "trigger", "trigger_on_finish", "schedule", "card",
+    }
 
-        For steps that carry @resources, the resource hints are forwarded to the
-        Metaflow compute backend via an extra resources:cpu=N,memory=M,gpu=G entry
-        in STEP_WITH_DECORATORS so backends like @kubernetes pick them up.
+    def _build_step_decorator_info(self) -> "dict[str, list[str]]":
+        """Return a step_name -> list[str] mapping of --with decorator specs.
+
+        All step-level decorators (except those in _SKIP_WITH_DECORATORS) are
+        forwarded as --with flags to the Metaflow CLI subprocess, letting
+        Metaflow manage its own decorator lifecycle.  @resources is forwarded
+        as a separate resources:cpu=N,memory=M,gpu=G spec so compute backends
+        like @kubernetes pick them up.
         """
-        specs: dict[str, list[str]] = {}
         withs: dict[str, list[str]] = {}
         for node in self._topological_order():
-            step_specs = [d.make_decorator_spec() for d in node.decorators]
-            step_specs.extend(self.with_decorators)
-            specs[node.name] = step_specs
             step_withs = list(self.with_decorators)
+            for d in node.decorators:
+                if d.name in self._SKIP_WITH_DECORATORS:
+                    continue
+                try:
+                    spec = d.make_decorator_spec()
+                    if spec:
+                        step_withs.append(spec)
+                except Exception:
+                    pass
             # Forward @resources hints so compute backends receive them
             resources_spec = self._build_resources_spec(node)
             if resources_spec:
                 step_withs.append(resources_spec)
             withs[node.name] = step_withs
-        return specs, withs
+        return withs
 
     def _build_step_conda_env_ids(self) -> "dict[str, str | None]":
         """Return a mapping of step_name -> conda environment id_ (or None).
