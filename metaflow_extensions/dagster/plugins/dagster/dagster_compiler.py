@@ -905,7 +905,14 @@ class DagsterCompiler:
 
     def _render_start_op(self, node) -> str:
         """The start step always runs init+step; outputs depend on its graph type."""
-        ntype = node.type  # 'start', 'split', or 'foreach'
+        ntype = node.type  # 'start', 'split', 'foreach', 'split-switch', or 'end' (single-step)
+        # Single-step flows annotate one step as both start and end. Metaflow's
+        # graph upgrades a single-step entry's type to "end" rather than
+        # "start". From the dagster compiler's perspective the start treatment
+        # is the same as a plain linear start (init + step + emit task_path),
+        # so normalize the type here.
+        if ntype == "end" and getattr(node, "is_start_step", False):
+            ntype = "start"
         config_ann = f", config: {self.flow_name}Config" if self.parameters else ""
         param_dict = (
             "{" + ", ".join(f'"{p["name"]}": config.{p["name"]}' for p in self.parameters) + "}"

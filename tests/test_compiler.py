@@ -790,3 +790,29 @@ class TestCustomNamedFlow:
         assert "r_entry" in code
         assert "r_start " not in code  # space-suffixed to avoid r_start__body false positives
 
+
+
+class TestSingleStepNamedFlow:
+    """Regression: single-step flow annotated with @step(start=True, end=True).
+
+    Metaflow's graph upgrades the entry step's type to "end" (not "start")
+    in this case (graph.py: `if start_step == end_step: nodes[start_step].type = "end"`),
+    so the dagster _render_start_op dispatch hit
+    NotImplementedError("start step with type 'end'") on the
+    custom-branch-flow PR's first deployer-test cycle. Normalize "end" back
+    to "start" inside _render_start_op when the node is the resolved entry.
+    """
+
+    def setup_method(self):
+        self.flow_cls = _import_flow("single_step_named_flow")
+
+    def test_compiles_without_error(self):
+        code = _compile(self.flow_cls)
+        assert _is_valid_python(code)
+
+    def test_op_emitted_for_single_step(self):
+        code = _compile(self.flow_cls)
+        assert "def op_only(" in code
+        # _run_step must reference the actual step name, not "start" / "end".
+        assert '"only"' in code
+
