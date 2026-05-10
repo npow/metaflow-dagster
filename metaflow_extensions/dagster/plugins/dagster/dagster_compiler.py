@@ -740,7 +740,12 @@ class DagsterCompiler:
         if self._topo_cache is None:
             # Collect all reachable nodes first
             all_nodes: dict = {}
-            stack = [self.graph["start"]]
+            # Metaflow >= 2.19.x lets a flow's entry step have any name via
+            # @step(start=True) (Netflix/metaflow#3120). graph.start_step
+            # holds the resolved name; fall back to "start" for older
+            # metaflow versions that lack the attribute.
+            start_name = getattr(self.graph, "start_step", None) or "start"
+            stack = [self.graph[start_name]]
             while stack:
                 node = stack.pop()
                 if node.name in all_nodes:
@@ -813,8 +818,11 @@ class DagsterCompiler:
         return next(p for p in common if self.graph[p].type == "split-switch")
 
     def _render_op(self, node) -> str:
-        # The "start" step is special regardless of its graph type
-        if node.name == "start":
+        # The start step is special regardless of its graph type. Use
+        # graph.start_step so flows that name their entry step anything
+        # other than "start" (via @step(start=True)) still route here.
+        start_name = getattr(self.graph, "start_step", None) or "start"
+        if node.name == start_name:
             return self._render_start_op(node)
         ntype = node.type
         if ntype == "end":
@@ -907,13 +915,15 @@ class DagsterCompiler:
         env_code = self._extra_env_code(node)
         max_retries, _ = self._get_retry_info(node)
 
-        # The common body: init then step
+        # The common body: init then step. Use node.name so flows that
+        # name their entry step anything other than "start" (via
+        # @step(start=True)) emit the correct Metaflow step path.
         common = (
             f'    run_id = _make_run_id(context.run_id)\n'
             f'    parameters = {param_dict}\n'
             f'    params_path = _run_init(context, run_id, "params", parameters)\n'
             f'    task_path = _run_step(\n'
-            f'        context, "start", run_id, params_path, "1",\n'
+            f'        context, "{node.name}", run_id, params_path, "1",\n'
             f'        retry_count=context.retry_number,\n'
             f'        max_user_code_retries={max_retries},\n'
             f'        tags={tags_code},\n'
@@ -921,7 +931,7 @@ class DagsterCompiler:
             f'    )\n'
         )
 
-        op_name = self._op_name("start")
+        op_name = self._op_name(node.name)
         if ntype == "start":
             deco = self._op_decorator_str(node, out_spec="Out(str)")
             return (
@@ -953,7 +963,7 @@ class DagsterCompiler:
                 f'def {op_name}(context: OpExecutionContext{config_ann}):\n'
                 + common
                 + '    _add_step_metadata(context, task_path)\n'
-                + '    num_splits = _get_foreach_splits(run_id, "start", "1")\n'
+                + f'    num_splits = _get_foreach_splits(run_id, "{node.name}", "1")\n'
                 + '    for _i in range(num_splits):\n'
                 + '        yield DynamicOutput(f"{task_path}//_i={_i}", mapping_key=str(_i))\n'
             )
@@ -966,7 +976,7 @@ class DagsterCompiler:
                 f'def {op_name}(context: OpExecutionContext{config_ann}):\n'
                 + common
                 + '    _add_step_metadata(context, task_path)\n'
-                + '    _branch = _get_condition_branch(run_id, "start", "1")\n'
+                + f'    _branch = _get_condition_branch(run_id, "{node.name}", "1")\n'
                 + '    yield Output(task_path, output_name=_branch)\n'
             )
         else:
@@ -1457,6 +1467,8 @@ class DagsterCompiler:
 
         chains = self._foreach_chains()
         steps_in_compound = self._steps_in_compound()
+        # Resolved entry-step name (honors @step(start=True), Netflix/metaflow#3120).
+        start_name = getattr(self.graph, "start_step", None) or "start"
 
         def _emit(node) -> None:
             # Skip steps handled inside compound ops
@@ -1467,19 +1479,21 @@ class DagsterCompiler:
             ntype = node.type
 
             # ── start step ────────────────────────────────────────────────────
-            if node.name == "start":
-                var = "r_start"
+            # Match the entry step by name resolved from graph.start_step
+            # so @step(start=True) flows with custom entry names route here.
+            if node.name == start_name:
+                var = f"r_{node.name}"
                 lines.append(f"{var} = {op_call}()")
-                var_map["start"] = var
+                var_map[node.name] = var
                 if ntype in ("split", "split-switch"):
                     for branch in node.out_funcs:
                         var_map[f"_branch_{branch}"] = f"{var}.{branch}"
-                elif ntype == "foreach" and "start" in chains:
-                    chain = chains["start"]
+                elif ntype == "foreach" and node.name in chains:
+                    chain = chains[node.name]
                     if len(chain) > 1:
                         # Nested foreach
-                        compound_name = self._compound_op_name("start")
-                        compound_var = "r_start__body"
+                        compound_name = self._compound_op_name(node.name)
+                        compound_var = f"r_{node.name}__body"
                         lines.append(f"{compound_var} = {var}.map({compound_name})")
                         outer_body_name = chain[0][1]
                         var_map[outer_body_name] = compound_var
@@ -1488,8 +1502,8 @@ class DagsterCompiler:
                         _, body_name, join_name = chain[0]
                         interior = self._foreach_body_interior_steps(body_name, join_name)
                         if len(interior) > 1:
-                            compound_name = self._compound_op_name("start")
-                            compound_var = "r_start__body"
+                            compound_name = self._compound_op_name(node.name)
+                            compound_var = f"r_{node.name}__body"
                             lines.append(f"{compound_var} = {var}.map({compound_name})")
                             var_map[body_name] = compound_var
 
@@ -1682,11 +1696,15 @@ class DagsterCompiler:
         event_name = trigger["event_name"]
         param_map = trigger["parameter_map"]
         sensor_name = f"{self.job_name}_on_event_{idx}"
-        # Build run_config snippet when there are parameter mappings
+        # Build run_config snippet when there are parameter mappings.
+        # The op carrying flow params is the start step — use its resolved
+        # name (honors @step(start=True), Netflix/metaflow#3120).
+        start_name = getattr(self.graph, "start_step", None) or "start"
+        start_op = self._op_name(start_name)
         if param_map:
             run_config_lines = (
                 "        run_config = {\n"
-                '            "ops": {"start": {"config": {\n'
+                f'            "ops": {{"{start_op}": {{"config": {{\n'
             )
             for flow_param, event_field in param_map.items():
                 run_config_lines += (
