@@ -42,9 +42,9 @@ jobs:
         run: echo "/usr/share/miniconda/bin" >> $GITHUB_PATH
 
 
-      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@master
         with:
-          metaflow-ref: npow/corral-devstack
+          metaflow-ref: master
           extra-install: ".[test]"
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
           # Use a higher per-test timeout (600s) because dagster jobs run steps
