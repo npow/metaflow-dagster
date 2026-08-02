@@ -745,3 +745,74 @@ class TestNestedForeach3Level:
         code = _compile(self.flow_cls)
         assert ".map(" in code
         assert ".collect()" in code
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Custom start/end step names (Netflix/metaflow#3120)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCustomNamedFlow:
+    """Regression: @step(start=True)/@step(end=True) lets the entry/terminal
+    step have any name, exposed via graph.start_step / graph.end_step. The
+    compiler must not hardcode the literal step name "start" anywhere it
+    references the entry step (var names, run_step paths, op_name lookups,
+    chains/var_map keys). Before the fix, compilation crashed with
+    KeyError: 'start' at _topological_order's `self.graph["start"]` lookup."""
+
+    def setup_method(self):
+        self.flow_cls = _import_flow("custom_named_flow")
+
+    def test_compiles_without_error(self):
+        code = _compile(self.flow_cls)
+        assert _is_valid_python(code)
+
+    def test_uses_actual_entry_step_name(self):
+        code = _compile(self.flow_cls)
+        # Generated dagster ops should be named after the actual steps
+        assert "def op_entry(" in code
+        assert "def op_done(" in code
+        # And no hardcoded "op_start" / "op_end" should appear
+        assert "def op_start(" not in code
+        assert "def op_end(" not in code
+
+    def test_run_step_uses_actual_step_name(self):
+        # _run_step(context, "<step>", ...) must reference the actual entry name.
+        code = _compile(self.flow_cls)
+        assert '"entry"' in code
+        # _run_step calls for the start step should NOT pass the literal "start".
+        # Allow "start" only inside comments/docstrings (extremely unlikely here).
+        assert '_run_step(\n        context, "start"' not in code
+
+    def test_job_body_uses_actual_var_names(self):
+        code = _compile(self.flow_cls)
+        # Job body should bind r_entry (not r_start) for the entry step.
+        assert "r_entry" in code
+        assert "r_start " not in code  # space-suffixed to avoid r_start__body false positives
+
+
+
+class TestSingleStepNamedFlow:
+    """Regression: single-step flow annotated with @step(start=True, end=True).
+
+    Metaflow's graph upgrades the entry step's type to "end" (not "start")
+    in this case (graph.py: `if start_step == end_step: nodes[start_step].type = "end"`),
+    so the dagster _render_start_op dispatch hit
+    NotImplementedError("start step with type 'end'") on the
+    custom-branch-flow PR's first deployer-test cycle. Normalize "end" back
+    to "start" inside _render_start_op when the node is the resolved entry.
+    """
+
+    def setup_method(self):
+        self.flow_cls = _import_flow("single_step_named_flow")
+
+    def test_compiles_without_error(self):
+        code = _compile(self.flow_cls)
+        assert _is_valid_python(code)
+
+    def test_op_emitted_for_single_step(self):
+        code = _compile(self.flow_cls)
+        assert "def op_only(" in code
+        # _run_step must reference the actual step name, not "start" / "end".
+        assert '"only"' in code
+
